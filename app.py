@@ -49,7 +49,7 @@ def fetch_market_pulse():
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
-    # Safely format the ticker (e.g., converts "Tata Steel" to "TATASTEEL")
+    # Format the ticker so names like "Tata Steel" become "TATASTEEL"
     ticker = ticker.upper().strip().replace(" ", "")
     
     urls = [
@@ -99,7 +99,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     red_flags = []
     score = 0
 
-    # Safely parse metrics or default to 0
+    # Parse metrics safely
     roce = data.get("roce", 0.0)
     roe = data.get("roe", 0.0)
     pe = data.get("stock p/e", 0.0)
@@ -110,7 +110,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     current_price = data.get("current price", 0.0)
     pb = current_price / book_value if book_value > 0 else 999.0
 
-    # Hard Disqualifiers
+    # Rules Engine Gates
     if book_value <= 0:
         red_flags.append("🚨 Negative Net Worth: Automatic Disqualification.")
     if pledge > 5.0:
@@ -118,7 +118,6 @@ def evaluate_fundamentals(data: dict) -> dict:
     if debt_equity > 1.5:
         red_flags.append(f"🚨 Excessive Debt to Equity: {debt_equity}x.")
 
-    # Quality Checks
     if roce >= 15.0 and roe >= 15.0:
         score += 30
         reasons.append(f"✅ Strong capital efficiency: ROCE ({roce}%) and ROE ({roe}%) > 15%.")
@@ -170,8 +169,9 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. AI REASONING LAYER (With Google Search)
+# 4. AI REASONING LAYER (Cached to save Quota!)
 # -----------------------------------------
+@st.cache_data(ttl=3600)  # Caches the AI response for 1 hour so you don't burn tokens on reruns
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
     
@@ -195,21 +195,24 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) 
         3. Provide a concise, highly insightful 3-bullet point thesis on whether this stock is a MULTIBAGGER, BUY, AVOID, or WATCH. 
         """
         
-        # Enable the AI to search Google live for updated context
+        # Tools enabled: Live Google Search
         config = types.GenerateContentConfig(
             tools=[{"google_search": {}}],
             temperature=0.2 
         )
         
-        # Using the updated model version
         response = client.models.generate_content(
             model='gemini-3.6-flash',
             contents=prompt,
             config=config
         )
         return response.text
+
     except Exception as e:
-        return f"AI Analysis failed: {str(e)}"
+        error_msg = str(e)
+        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            return "⚠️ **Free Tier Quota Exceeded:** You are analyzing too many stocks too quickly! Wait a few minutes before trying again."
+        return f"AI Analysis failed: {error_msg}"
 
 # -----------------------------------------
 # 5. STREAMLIT UI DASHBOARD
