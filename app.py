@@ -1,13 +1,13 @@
-import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import yfinance as yf
-from google import genai
-from google.genai import types
-from duckduckgo_search import DDGS
 import io
 import time
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
+from google import genai
+from google.genai import types
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
 
 # -----------------------------------------
 # 1. LIVE MARKET DATA ENGINE (yfinance)
@@ -52,7 +52,6 @@ def fetch_market_pulse():
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
-    # Automatically strips spaces so inputs like "Tata Steel" resolve to "TATASTEEL"
     clean_ticker = ticker.upper().strip().replace(" ", "")
     
     urls = [
@@ -241,7 +240,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. WEB SEARCH & AI LAYER (With Exponential Backoff)
+# 4. WEB SEARCH & AI LAYER (Reinforced Retry Loop)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_live_news(ticker: str) -> str:
@@ -282,9 +281,10 @@ Task:
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
-        # Exponential backoff retry loop for 503 UNAVAILABLE or 429 rate limit spikes
-        max_retries = 3
-        delay = 3
+        # 5 retries with backoff to handle 503 UNAVAILABLE or 429 rate limit spikes
+        max_retries = 5
+        delay = 4
+        
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
@@ -300,7 +300,7 @@ Task:
                     delay *= 2
                     continue
                 else:
-                    return f"AI Analysis failed: {err_str}"
+                    return f"⚠️ **API Temporary Constraint ({err_str[:40]}...)**: Google's servers are under high load. Please wait a minute and re-run."
                     
     except Exception as e:
         return f"Execution error: {str(e)}"
