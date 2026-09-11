@@ -83,10 +83,7 @@ def fetch_screener_data(ticker: str) -> dict:
         if name_elem and val_elem:
             name = name_elem.text.strip().lower()
             val_clean = val_elem.text.strip().replace(",", "")
-            try:
-                data[name] = float(val_clean)
-            except ValueError:
-                data[name] = val_clean
+            data[name] = val_clean # We store raw string, parse safely later
 
     # Scrape Points 2, 4, 5, 6, 7: Deep HTML Tables
     table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding"]
@@ -133,14 +130,26 @@ def evaluate_fundamentals(data: dict) -> dict:
     score = 0
     tables = data.get("tables", {})
 
+    # SAFELY CONVERT TO FLOAT TO PREVENT CRASHES ON MISSING DATA
+    def safe_float(val, default=0.0):
+        if val is None:
+            return default
+        try:
+            return float(str(val).replace(',', '').strip())
+        except (ValueError, TypeError):
+            return default
+
     # POINT 1: Top Quick Ratios
-    book_value = data.get("book value", 1.0)
-    current_price = data.get("current price", 0.0)
+    book_value = safe_float(data.get("book value"), 1.0)
+    current_price = safe_float(data.get("current price"), 0.0)
+    market_cap = safe_float(data.get("market cap"), 0.0)
+    pe_ratio = safe_float(data.get("stock p/e"), 0.0)
+    roce = safe_float(data.get("roce"), 0.0)
+    roe = safe_float(data.get("roe"), 0.0)
+    debt_equity = safe_float(data.get("debt to equity"), 0.0)
+    pledge = safe_float(data.get("pledged percentage"), 0.0)
+    
     pb = (current_price / book_value) if book_value > 0 else 999.0
-    roce = data.get("roce", 0.0)
-    roe = data.get("roe", 0.0)
-    debt_equity = data.get("debt to equity", 0.0)
-    pledge = data.get("pledged percentage", 0.0)
 
     if book_value <= 0:
         red_flags.append("🚨 Point 6 (Balance Sheet): Negative Net Worth / Book Value is negative.")
@@ -152,7 +161,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     if roce >= 15.0 and roe >= 15.0:
         score += 15
         reasons.append(f"✅ Point 1 (Capital Efficiency): Strong consistency — ROCE {roce}%, ROE {roe}%.")
-    else:
+    elif roce > 0 or roe > 0:
         reasons.append(f"⚠️ Point 1 (Capital Efficiency): Sub-par ROCE ({roce}%) or ROE ({roe}%).")
 
     # POINT 4: Quarterly Results (OPM Expansion Check)
@@ -230,8 +239,8 @@ def evaluate_fundamentals(data: dict) -> dict:
         "flags": red_flags,
         "observations": reasons,
         "clean_metrics": {
-            "Market Cap (Cr)": data.get("market cap", 0.0),
-            "P/E": data.get("stock p/e", 0.0),
+            "Market Cap (Cr)": market_cap,
+            "P/E": pe_ratio,
             "P/B": round(pb, 2),
             "ROCE %": roce,
             "ROE %": roe,
