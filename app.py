@@ -49,7 +49,9 @@ def fetch_market_pulse():
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
-    ticker = ticker.upper().strip()
+    # Safely format the ticker (e.g., converts "Tata Steel" to "TATASTEEL")
+    ticker = ticker.upper().strip().replace(" ", "")
+    
     urls = [
         f"https://www.screener.in/company/{ticker}/consolidated/",
         f"https://www.screener.in/company/{ticker}/"
@@ -71,6 +73,7 @@ def fetch_screener_data(ticker: str) -> dict:
     soup = BeautifulSoup(resp.content, "html.parser")
     data = {"ticker": ticker}
 
+    # Scrape core ratios
     ratio_items = soup.select("#top-ratios li")
     for li in ratio_items:
         name_elem = li.select_one(".name")
@@ -96,6 +99,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     red_flags = []
     score = 0
 
+    # Safely parse metrics or default to 0
     roce = data.get("roce", 0.0)
     roe = data.get("roe", 0.0)
     pe = data.get("stock p/e", 0.0)
@@ -106,6 +110,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     current_price = data.get("current price", 0.0)
     pb = current_price / book_value if book_value > 0 else 999.0
 
+    # Hard Disqualifiers
     if book_value <= 0:
         red_flags.append("🚨 Negative Net Worth: Automatic Disqualification.")
     if pledge > 5.0:
@@ -113,6 +118,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     if debt_equity > 1.5:
         red_flags.append(f"🚨 Excessive Debt to Equity: {debt_equity}x.")
 
+    # Quality Checks
     if roce >= 15.0 and roe >= 15.0:
         score += 30
         reasons.append(f"✅ Strong capital efficiency: ROCE ({roce}%) and ROE ({roe}%) > 15%.")
@@ -133,6 +139,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         score += 10
         reasons.append("✅ Zero promoter pledge.")
 
+    # Final Verdict Gate
     verdict = "WATCH"
     color = "orange"
     
@@ -163,27 +170,43 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. AI REASONING LAYER (Using st.secrets)
+# 4. AI REASONING LAYER (With Google Search)
 # -----------------------------------------
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
-    # Safely retrieve the key from Streamlit secrets
     api_key = st.secrets.get("GEMINI_API_KEY", None)
     
     if not api_key:
-        return "⚠️ Gemini API key not found. Please set `GEMINI_API_KEY` inside `.streamlit/secrets.toml` or Streamlit Cloud Secrets."
+        return "⚠️ Gemini API key not found. Please set `GEMINI_API_KEY` inside `.streamlit/secrets.toml`."
         
     try:
         client = genai.Client(api_key=api_key)
+        
         prompt = f"""
-        You are a strict, fundamental equity analyst. Evaluate this Indian stock: {ticker}.
-        Quantitative Data: {metrics}
-        Red Flags Detected: {flags}
-        Rule-Based Observations: {observations}
+        You are an expert fundamental equity analyst. Evaluate this Indian stock: {ticker}.
+        
+        The quantitative screening engine found the following:
+        - Metrics: {metrics}
+        - Red Flags: {flags}
+        - Observations: {observations}
+        
         Task:
-        1. Identify potential 'inflection points' (margin expansion, capacity additions, new order books).
-        2. Provide a final 3-bullet point thesis on whether this is a MULTIBAGGER, BUY, AVOID, or WATCH.
+        1. Use Google Search to find the latest news, recent concall highlights, or business developments for {ticker}.
+        2. Identify if there are any real-world 'inflection points' happening right now (e.g., new factory, massive order win, government policy tailwind).
+        3. Provide a concise, highly insightful 3-bullet point thesis on whether this stock is a MULTIBAGGER, BUY, AVOID, or WATCH. 
         """
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        
+        # Enable the AI to search Google live for updated context
+        config = types.GenerateContentConfig(
+            tools=[{"google_search": {}}],
+            temperature=0.2 
+        )
+        
+        # Using the updated model version
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=prompt,
+            config=config
+        )
         return response.text
     except Exception as e:
         return f"AI Analysis failed: {str(e)}"
@@ -231,7 +254,7 @@ st.markdown("---")
 # --- MAIN SCREENER ---
 st.title("📈 AI-Powered Multibagger Screener")
 
-ticker_input = st.text_input("🔍 Enter NSE/BSE Ticker (e.g., HFCL, ATHER, ITC):", "")
+ticker_input = st.text_input("🔍 Enter NSE/BSE Ticker (e.g., HFCL, TATA STEEL, ITC):", "")
 
 if st.button("Run Analysis") and ticker_input:
     with st.spinner(f"Scraping Screener.in for {ticker_input.upper()}..."):
@@ -268,8 +291,8 @@ if st.button("Run Analysis") and ticker_input:
                     st.write(flag)
         
         with col2:
-            st.subheader("3. AI Reasoning & Inflection Check")
-            with st.spinner("Analyzing fundamentals with Gemini..."):
+            st.subheader("3. AI Reasoning & Web Search Insight")
+            with st.spinner("Searching the web for the latest catalysts..."):
                 ai_insight = get_ai_verdict(
                     ticker=ticker_input.upper(),
                     metrics=metrics,
