@@ -5,6 +5,7 @@ import pandas as pd
 import yfinance as yf
 from google import genai
 from google.genai import types
+from duckduckgo_search import DDGS  # The new free search library
 
 # -----------------------------------------
 # 1. LIVE MARKET DATA ENGINE (yfinance)
@@ -49,16 +50,14 @@ def fetch_market_pulse():
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
-    # Format the ticker so names like "Tata Steel" become "TATASTEEL"
     ticker = ticker.upper().strip().replace(" ", "")
-    
     urls = [
         f"https://www.screener.in/company/{ticker}/consolidated/",
         f"https://www.screener.in/company/{ticker}/"
     ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
     resp = None
@@ -73,7 +72,6 @@ def fetch_screener_data(ticker: str) -> dict:
     soup = BeautifulSoup(resp.content, "html.parser")
     data = {"ticker": ticker}
 
-    # Scrape core ratios
     ratio_items = soup.select("#top-ratios li")
     for li in ratio_items:
         name_elem = li.select_one(".name")
@@ -85,7 +83,6 @@ def fetch_screener_data(ticker: str) -> dict:
                 data[name] = float(val)
             except ValueError:
                 data[name] = val
-
     return data
 
 # -----------------------------------------
@@ -99,7 +96,6 @@ def evaluate_fundamentals(data: dict) -> dict:
     red_flags = []
     score = 0
 
-    # Parse metrics safely
     roce = data.get("roce", 0.0)
     roe = data.get("roe", 0.0)
     pe = data.get("stock p/e", 0.0)
@@ -110,7 +106,6 @@ def evaluate_fundamentals(data: dict) -> dict:
     current_price = data.get("current price", 0.0)
     pb = current_price / book_value if book_value > 0 else 999.0
 
-    # Rules Engine Gates
     if book_value <= 0:
         red_flags.append("🚨 Negative Net Worth: Automatic Disqualification.")
     if pledge > 5.0:
@@ -138,7 +133,6 @@ def evaluate_fundamentals(data: dict) -> dict:
         score += 10
         reasons.append("✅ Zero promoter pledge.")
 
-    # Final Verdict Gate
     verdict = "WATCH"
     color = "orange"
     
@@ -169,9 +163,25 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. AI REASONING LAYER (Cached to save Quota!)
+# 4. FREE WEB SEARCH & AI REASONING
 # -----------------------------------------
-@st.cache_data(ttl=3600)  # Caches the AI response for 1 hour so you don't burn tokens on reruns
+@st.cache_data(ttl=3600)
+def fetch_live_news(ticker: str) -> str:
+    """Scrapes DuckDuckGo for the latest news for free."""
+    try:
+        # DDGS().text() searches DuckDuckGo programmatically
+        results = DDGS().text(f"{ticker} stock news India latest update", max_results=5) 
+        if not results:
+            return "No recent news found on the web."
+        
+        news_text = "Latest Web Headlines:\n"
+        for r in results:
+            news_text += f"- {r['title']}: {r['body']}\n"
+        return news_text
+    except Exception as e:
+        return f"Web search bypassed due to error: {str(e)}"
+
+@st.cache_data(ttl=3600)
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
     
@@ -179,27 +189,30 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) 
         return "⚠️ Gemini API key not found. Please set `GEMINI_API_KEY` inside `.streamlit/secrets.toml`."
         
     try:
+        # Step 1: Get free live news from DuckDuckGo
+        live_news = fetch_live_news(ticker)
+        
+        # Step 2: Feed everything into the AI
         client = genai.Client(api_key=api_key)
         
         prompt = f"""
         You are an expert fundamental equity analyst. Evaluate this Indian stock: {ticker}.
         
-        The quantitative screening engine found the following:
+        Quantitative Data:
         - Metrics: {metrics}
         - Red Flags: {flags}
-        - Observations: {observations}
+        - Rule-Based Observations: {observations}
+        
+        Live Market Context (Scraped from Web):
+        {live_news}
         
         Task:
-        1. Use Google Search to find the latest news, recent concall highlights, or business developments for {ticker}.
-        2. Identify if there are any real-world 'inflection points' happening right now (e.g., new factory, massive order win, government policy tailwind).
-        3. Provide a concise, highly insightful 3-bullet point thesis on whether this stock is a MULTIBAGGER, BUY, AVOID, or WATCH. 
+        1. Identify if there are any real-world 'inflection points' happening right now based on the news (e.g., new factory, massive order win).
+        2. Provide a concise, highly insightful 3-bullet point thesis on whether this stock is a MULTIBAGGER, BUY, AVOID, or WATCH. 
         """
         
-        # Tools enabled: Live Google Search
-        config = types.GenerateContentConfig(
-            tools=[{"google_search": {}}],
-            temperature=0.2 
-        )
+        # Notice we removed the 'google_search' tool from config! This prevents the 429 error.
+        config = types.GenerateContentConfig(temperature=0.2)
         
         response = client.models.generate_content(
             model='gemini-3.6-flash',
@@ -209,17 +222,13 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) 
         return response.text
 
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-            return "⚠️ **Free Tier Quota Exceeded:** You are analyzing too many stocks too quickly! Wait a few minutes before trying again."
-        return f"AI Analysis failed: {error_msg}"
+        return f"AI Analysis failed: {str(e)}"
 
 # -----------------------------------------
 # 5. STREAMLIT UI DASHBOARD
 # -----------------------------------------
 st.set_page_config(page_title="AI Fundamental Screener", layout="wide")
 
-# --- LIVE MARKET HEADER ---
 st.markdown("### 📊 Live Market Pulse")
 market_data = fetch_market_pulse()
 
@@ -254,7 +263,6 @@ if market_data and "error" not in market_data:
                 st.markdown(f"- **{sec_name}**: {sec_data['change']:.2f}% 🔴")
 st.markdown("---")
 
-# --- MAIN SCREENER ---
 st.title("📈 AI-Powered Multibagger Screener")
 
 ticker_input = st.text_input("🔍 Enter NSE/BSE Ticker (e.g., HFCL, TATA STEEL, ITC):", "")
@@ -295,7 +303,7 @@ if st.button("Run Analysis") and ticker_input:
         
         with col2:
             st.subheader("3. AI Reasoning & Web Search Insight")
-            with st.spinner("Searching the web for the latest catalysts..."):
+            with st.spinner("Searching DuckDuckGo and asking Gemini for analysis..."):
                 ai_insight = get_ai_verdict(
                     ticker=ticker_input.upper(),
                     metrics=metrics,
