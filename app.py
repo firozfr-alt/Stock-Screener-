@@ -9,11 +9,9 @@ from google.genai import types
 # -----------------------------------------
 # 1. LIVE MARKET DATA ENGINE (yfinance)
 # -----------------------------------------
-@st.cache_data(ttl=60) # Caches for 60 seconds to avoid spamming the API
+@st.cache_data(ttl=60)
 def fetch_market_pulse():
     pulse_data = {}
-    
-    # Define Tickers (Yahoo Finance uses ^NSEI for Nifty 50, ^NSEBANK for Bank Nifty)
     indices = {
         "Nifty 50": "^NSEI",
         "Bank Nifty": "^NSEBANK",
@@ -25,7 +23,6 @@ def fetch_market_pulse():
     }
     
     try:
-        # Fetch data for all tickers in one go for the last 2 days to calculate % change
         tickers = " ".join(indices.values())
         data = yf.download(tickers, period="2d", group_by="ticker", progress=False)
         
@@ -37,7 +34,6 @@ def fetch_market_pulse():
                     prev_close = ticker_data['Close'].iloc[-2]
                     pct_change = ((current_price - prev_close) / prev_close) * 100
                     
-                    # Convert pandas Series/scalars to standard floats to avoid UI rendering issues
                     pulse_data[name] = {
                         "price": float(current_price),
                         "change": float(pct_change),
@@ -167,11 +163,14 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. AI REASONING LAYER
+# 4. AI REASONING LAYER (Using st.secrets)
 # -----------------------------------------
-def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list, api_key: str) -> str:
+def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
+    # Safely retrieve the key from Streamlit secrets
+    api_key = st.secrets.get("GEMINI_API_KEY", None)
+    
     if not api_key:
-        return "⚠️ Please enter your Gemini API key in the sidebar to enable AI analysis."
+        return "⚠️ Gemini API key not found. Please set `GEMINI_API_KEY` inside `.streamlit/secrets.toml` or Streamlit Cloud Secrets."
         
     try:
         client = genai.Client(api_key=api_key)
@@ -181,7 +180,7 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list, 
         Red Flags Detected: {flags}
         Rule-Based Observations: {observations}
         Task:
-        1. Identify potential 'inflection points' (margin expansion, capacity additions).
+        1. Identify potential 'inflection points' (margin expansion, capacity additions, new order books).
         2. Provide a final 3-bullet point thesis on whether this is a MULTIBAGGER, BUY, AVOID, or WATCH.
         """
         response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
@@ -192,14 +191,13 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list, 
 # -----------------------------------------
 # 5. STREAMLIT UI DASHBOARD
 # -----------------------------------------
-st.set_page_config(page_title="AI Fundamental Screener", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="AI Fundamental Screener", layout="wide")
 
 # --- LIVE MARKET HEADER ---
 st.markdown("### 📊 Live Market Pulse")
 market_data = fetch_market_pulse()
 
 if market_data and "error" not in market_data:
-    # Top Row: Nifty and Bank Nifty
     col1, col2, col3, col4 = st.columns(4)
     
     if "Nifty 50" in market_data:
@@ -212,7 +210,6 @@ if market_data and "error" not in market_data:
         col3.metric("Bank Nifty Index", f"₹{bank['price']:.2f}", f"{bank['change']:.2f}%")
         col4.markdown(f"**Bank Nifty Trend**<br>{bank['bias']}", unsafe_allow_html=True)
 
-    # Calculate Top/Worst Sectors
     sectors = {k: v for k, v in market_data.items() if k not in ["Nifty 50", "Bank Nifty", "error"]}
     if sectors:
         sorted_sectors = sorted(sectors.items(), key=lambda x: x[1]['change'], reverse=True)
@@ -233,8 +230,6 @@ st.markdown("---")
 
 # --- MAIN SCREENER ---
 st.title("📈 AI-Powered Multibagger Screener")
-st.sidebar.header("Configuration")
-gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
 
 ticker_input = st.text_input("🔍 Enter NSE/BSE Ticker (e.g., HFCL, ATHER, ITC):", "")
 
@@ -274,12 +269,11 @@ if st.button("Run Analysis") and ticker_input:
         
         with col2:
             st.subheader("3. AI Reasoning & Inflection Check")
-            with st.spinner("Asking Gemini for qualitative catalysts..."):
+            with st.spinner("Analyzing fundamentals with Gemini..."):
                 ai_insight = get_ai_verdict(
                     ticker=ticker_input.upper(),
                     metrics=metrics,
                     flags=eval_results["flags"],
-                    observations=eval_results["observations"],
-                    api_key=gemini_key
+                    observations=eval_results["observations"]
                 )
             st.info(ai_insight)
