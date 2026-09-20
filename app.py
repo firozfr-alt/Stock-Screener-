@@ -8,6 +8,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+# Added tenacity for automatic exponential backoff
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 
 # -----------------------------------------
 # 1. LIVE MARKET DATA ENGINE (yfinance)
@@ -261,6 +263,26 @@ def fetch_live_news(ticker: str) -> str:
     except Exception as e:
         return f"Web news bypassed: {str(e)}"
 
+# --- NEW EXPONENTIAL BACKOFF LOGIC ---
+def is_rate_limit_error(exception):
+    """Checks if the exception text indicates a 429 or 503 error."""
+    err_str = str(exception)
+    return any(err in err_str for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
+
+@retry(
+    wait=wait_random_exponential(multiplier=2, max=60),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception(is_rate_limit_error),
+    reraise=True
+)
+def generate_content_with_backoff(client, prompt, config):
+    """Wraps the Gemini API call with automatic retry logic via Tenacity."""
+    return client.models.generate_content(
+        model='gemini-3.6-flash',
+        contents=prompt,
+        config=config
+    )
+
 @st.cache_data(ttl=3600)
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
@@ -290,29 +312,13 @@ Task:
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
-        # 5 retries with backoff to handle 503 UNAVAILABLE or 429 rate limit spikes
-        max_retries = 5
-        delay = 4
+        # Call the new decorated function
+        response = generate_content_with_backoff(client, prompt, config)
+        return response.text
         
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-3.6-flash',
-                    contents=prompt,
-                    config=config
-                )
-                return response.text
-            except Exception as api_err:
-                err_str = str(api_err)
-                if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries - 1:
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                else:
-                    return f"⚠️ **API Temporary Constraint ({err_str[:40]}...)**: Google's servers are under high load. Please wait a minute and re-run."
-                    
     except Exception as e:
-        return f"Execution error: {str(e)}"
+        err_str = str(e)
+        return f"⚠️ **API Constraint/Error ({err_str[:40]}...)**: Request failed after multiple retries. Google's servers might be under heavy load."
 
 # -----------------------------------------
 # 5. STREAMLIT UI DASHBOARD
