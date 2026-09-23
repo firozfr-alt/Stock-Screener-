@@ -7,7 +7,6 @@ from google.genai import types
 import pandas as pd
 import requests
 import streamlit as st
-# Added tenacity for automatic exponential backoff
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 
 # -----------------------------------------
@@ -46,7 +45,7 @@ def fetch_screener_data(ticker: str) -> dict:
         if name_elem and val_elem:
             name = name_elem.text.strip().lower()
             val_clean = val_elem.text.strip().replace(",", "")
-            data[name] = val_clean # We store raw string, parse safely later
+            data[name] = val_clean 
 
     # Scrape Points 2, 4, 5, 6, 7: Deep HTML Tables
     table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding"]
@@ -93,7 +92,6 @@ def evaluate_fundamentals(data: dict) -> dict:
     score = 0
     tables = data.get("tables", {})
 
-    # SAFELY CONVERT TO FLOAT TO PREVENT CRASHES ON MISSING DATA
     def safe_float(val, default=0.0):
         if val is None:
             return default
@@ -127,7 +125,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     elif roce > 0 or roe > 0:
         reasons.append(f"⚠️ Point 1 (Capital Efficiency): Sub-par ROCE ({roce}%) or ROE ({roe}%).")
 
-    # POINT 4: Quarterly Results (OPM Expansion Check)
+    # POINT 4: Quarterly Results 
     q_df = tables.get("quarters")
     opm_trend = extract_trend(q_df, "OPM")
     if opm_trend and len(opm_trend) >= 4:
@@ -138,7 +136,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             reasons.append(f"⚠️ Point 4 (Quarterly Results): OPM margin trend is flat or contracting ({recent_opm[-1]}%).")
 
-    # POINT 5: Profit & Loss (10-Year Consistency & Chronic Losses)
+    # POINT 5: Profit & Loss 
     pnl_df = tables.get("profit-loss")
     net_profit = extract_trend(pnl_df, "Net Profit")
     if net_profit:
@@ -151,7 +149,7 @@ def evaluate_fundamentals(data: dict) -> dict:
                 score += 15
                 reasons.append(f"✅ Point 5 (P&L Consistency): Profitable in {profitable_years} of {total_years} recorded years.")
 
-    # POINT 6: Balance Sheet (Reserves Trend)
+    # POINT 6: Balance Sheet 
     bs_df = tables.get("balance-sheet")
     reserves = extract_trend(bs_df, "Reserves")
     if reserves and len(reserves) >= 2:
@@ -161,7 +159,7 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append("✅ Point 6 (Balance Sheet): Reserves are expanding.")
 
-    # POINT 7: Cash Flow Statement (Consistent Positive CFO)
+    # POINT 7: Cash Flow Statement 
     cf_df = tables.get("cash-flow")
     cfo = extract_trend(cf_df, "Operating Activity")
     if cfo:
@@ -172,7 +170,7 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append(f"✅ Point 7 (Cash Generation): Positive CFO in {positive_cfo} of {len(cfo)} recorded years.")
 
-    # POINT 2: Shareholding Pattern (Promoter Trend)
+    # POINT 2: Shareholding Pattern 
     sh_df = tables.get("shareholding")
     promoter = extract_trend(sh_df, "Promoters")
     if promoter and len(promoter) >= 4:
@@ -226,7 +224,6 @@ def fetch_live_news(ticker: str) -> str:
 
 # --- EXPONENTIAL BACKOFF LOGIC ---
 def is_rate_limit_error(exception):
-    """Checks if the exception text indicates a 429 or 503 error."""
     err_str = str(exception)
     return any(err in err_str for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
 
@@ -237,9 +234,8 @@ def is_rate_limit_error(exception):
     reraise=True
 )
 def generate_content_with_backoff(client, prompt, config):
-    """Wraps the Gemini API call with automatic retry logic via Tenacity."""
     return client.models.generate_content(
-        model='gemini-3.6-flash',
+        model='gemini-1.5-flash',
         contents=prompt,
         config=config
     )
@@ -273,7 +269,6 @@ Task:
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
-        # Call the new decorated function
         response = generate_content_with_backoff(client, prompt, config)
         return response.text
         
@@ -284,12 +279,13 @@ Task:
 # -----------------------------------------
 # 4. STREAMLIT UI DASHBOARD
 # -----------------------------------------
-# Configured for a centered, clean layout
-st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="centered")
+st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="wide")
 
 st.title("Fundamental Screener")
 
-ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
+col_search, _ = st.columns([1, 2])
+with col_search:
+    ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
 
 if st.button("Run Analysis") and ticker_input:
     with st.spinner(f"Scraping Screener.in tables and metrics for {ticker_input.upper()}..."):
@@ -307,7 +303,11 @@ if st.button("Run Analysis") and ticker_input:
         
         st.subheader("Point 1: Top Quick Ratios")
         cols = st.columns(6)
-        cols[0].metric("Market Cap (Cr)", metrics["Market Cap (Cr)"])
+        
+        # Formatted Market Cap to drop the trailing decimals
+        market_cap_formatted = f"{metrics['Market Cap (Cr)']:,.0f}"
+        
+        cols[0].metric("Market Cap (Cr)", market_cap_formatted)
         cols[1].metric("P/E", metrics["P/E"])
         cols[2].metric("P/B", metrics["P/B"])
         cols[3].metric("ROCE", f"{metrics['ROCE %']}%")
