@@ -234,9 +234,9 @@ def is_rate_limit_error(exception):
     reraise=True
 )
 def generate_content_with_backoff(client, prompt, config):
-    # FIXED: Updated to the correct active model string
+    # FIXED: Updated to the correct active model string for the Gemini 3 framework
     return client.models.generate_content(
-        model='gemini-2.0-flash',
+        model='gemini-3.5-flash',
         contents=prompt,
         config=config
     )
@@ -275,7 +275,9 @@ Task:
         
     except Exception as e:
         err_str = str(e)
-        return f"⚠️ **API Constraint/Error ({err_str[:40]}...)**: Request failed after multiple retries. Google's servers might be under heavy load."
+        # Using st.error here instead of returning a string prevents Streamlit from successfully caching the failure
+        st.error(f"⚠️ **API Constraint/Error**: Request failed. {err_str}")
+        return "AI analysis could not be completed."
 
 # -----------------------------------------
 # 4. STREAMLIT UI DASHBOARD
@@ -334,4 +336,5 @@ if st.button("Run Analysis") and ticker_input:
                     flags=eval_results["flags"],
                     observations=eval_results["observations"]
                 )
-            st.info(ai_insight)
+            if ai_insight != "AI analysis could not be completed.":
+                st.info(ai_insight)
