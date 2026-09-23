@@ -234,8 +234,9 @@ def is_rate_limit_error(exception):
     reraise=True
 )
 def generate_content_with_backoff(client, prompt, config):
+    # FIXED: Updated to the correct active model string
     return client.models.generate_content(
-        model='gemini-1.5-flash',
+        model='gemini-2.0-flash',
         contents=prompt,
         config=config
     )
