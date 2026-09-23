@@ -7,50 +7,11 @@ from google.genai import types
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 # Added tenacity for automatic exponential backoff
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 
 # -----------------------------------------
-# 1. LIVE MARKET DATA ENGINE (yfinance)
-# -----------------------------------------
-@st.cache_data(ttl=60)
-def fetch_market_pulse():
-    pulse_data = {}
-    indices = {
-        "Nifty 50": "^NSEI",
-        "Bank Nifty": "^NSEBANK",
-        "IT": "^CNXIT",
-        "Auto": "^CNXAUTO",
-        "FMCG": "^CNXFMCG",
-        "Metal": "^CNXMETAL",
-        "Pharma": "^CNXPHARMA"
-    }
-    
-    try:
-        tickers = " ".join(indices.values())
-        data = yf.download(tickers, period="2d", group_by="ticker", progress=False)
-        
-        for name, ticker in indices.items():
-            if ticker in data:
-                ticker_data = data[ticker].dropna()
-                if len(ticker_data) >= 2:
-                    current_price = float(ticker_data['Close'].iloc[-1])
-                    prev_close = float(ticker_data['Close'].iloc[-2])
-                    pct_change = ((current_price - prev_close) / prev_close) * 100
-                    
-                    pulse_data[name] = {
-                        "price": current_price,
-                        "change": pct_change,
-                        "bias": "Bullish Uptrend 🟢" if pct_change > 0 else "Bearish Downtrend 🔴"
-                    }
-    except Exception as e:
-        pulse_data["error"] = str(e)
-        
-    return pulse_data
-
-# -----------------------------------------
-# 2. DATA EXTRACTION ENGINE (Screener.in)
+# 1. DATA EXTRACTION ENGINE (Screener.in)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
@@ -122,7 +83,7 @@ def extract_trend(df, keyword: str):
         return []
 
 # -----------------------------------------
-# 3. 10-POINT QUANTITATIVE SCORING ENGINE
+# 2. 10-POINT QUANTITATIVE SCORING ENGINE
 # -----------------------------------------
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -251,7 +212,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 4. WEB SEARCH & AI LAYER (Reinforced Retry Loop)
+# 3. WEB SEARCH & AI LAYER (Reinforced Retry Loop)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_live_news(ticker: str) -> str:
@@ -263,7 +224,7 @@ def fetch_live_news(ticker: str) -> str:
     except Exception as e:
         return f"Web news bypassed: {str(e)}"
 
-# --- NEW EXPONENTIAL BACKOFF LOGIC ---
+# --- EXPONENTIAL BACKOFF LOGIC ---
 def is_rate_limit_error(exception):
     """Checks if the exception text indicates a 429 or 503 error."""
     err_str = str(exception)
@@ -321,46 +282,14 @@ Task:
         return f"⚠️ **API Constraint/Error ({err_str[:40]}...)**: Request failed after multiple retries. Google's servers might be under heavy load."
 
 # -----------------------------------------
-# 5. STREAMLIT UI DASHBOARD
+# 4. STREAMLIT UI DASHBOARD
 # -----------------------------------------
-st.set_page_config(page_title="10-Point Multibagger Screener", layout="wide")
+# Configured for a centered, clean layout
+st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="centered")
 
-# --- LIVE MARKET HEADER ---
-st.markdown("### 📊 Live Market Pulse")
-market_data = fetch_market_pulse()
+st.title("Fundamental Screener")
 
-if market_data and "error" not in market_data:
-    col1, col2, col3, col4 = st.columns(4)
-    if "Nifty 50" in market_data:
-        nifty = market_data["Nifty 50"]
-        col1.metric("Nifty 50 Index", f"₹{nifty['price']:.2f}", f"{nifty['change']:.2f}%")
-        col2.markdown(f"**Nifty Trend**<br>{nifty['bias']}", unsafe_allow_html=True)
-    if "Bank Nifty" in market_data:
-        bank = market_data["Bank Nifty"]
-        col3.metric("Bank Nifty Index", f"₹{bank['price']:.2f}", f"{bank['change']:.2f}%")
-        col4.markdown(f"**Bank Nifty Trend**<br>{bank['bias']}", unsafe_allow_html=True)
-
-    sectors = {k: v for k, v in market_data.items() if k not in ["Nifty 50", "Bank Nifty", "error"]}
-    if sectors:
-        sorted_sectors = sorted(sectors.items(), key=lambda x: x[1]['change'], reverse=True)
-        top_2 = sorted_sectors[:2]
-        worst_2 = sorted_sectors[-2:]
-        
-        st.markdown("---")
-        sec_col1, sec_col2 = st.columns(2)
-        with sec_col1:
-            st.markdown("**🏆 Top Performing Sectors**")
-            for sec_name, sec_data in top_2:
-                st.markdown(f"- **{sec_name}**: {sec_data['change']:.2f}% 🟢")
-        with sec_col2:
-            st.markdown("**📉 Worst Performing Sectors**")
-            for sec_name, sec_data in worst_2:
-                st.markdown(f"- **{sec_name}**: {sec_data['change']:.2f}% 🔴")
-
-st.markdown("---")
-st.title("📈 10-Point Multibagger & Fundamental Screener")
-
-ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol or Name (e.g., HFCL, TATA STEEL, ITC, RENUKA):", "")
+ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
 
 if st.button("Run Analysis") and ticker_input:
     with st.spinner(f"Scraping Screener.in tables and metrics for {ticker_input.upper()}..."):
