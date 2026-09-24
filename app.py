@@ -76,7 +76,7 @@ def extract_trend(df, keyword: str):
         return []
 
 # -----------------------------------------
-# 2. QUANTITATIVE SCORING ENGINE (Upgraded)
+# 2. QUANTITATIVE SCORING ENGINE
 # -----------------------------------------
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -91,7 +91,6 @@ def evaluate_fundamentals(data: dict) -> dict:
         try: return float(str(val).replace(',', '').strip())
         except (ValueError, TypeError): return default
 
-    # POINT 1: Top Quick Ratios
     book_value = safe_float(data.get("book value"), 1.0)
     current_price = safe_float(data.get("current price"), 0.0)
     market_cap = safe_float(data.get("market cap"), 0.0)
@@ -115,7 +114,6 @@ def evaluate_fundamentals(data: dict) -> dict:
     elif roce > 0 or roe > 0:
         reasons.append(f"⚠️ Point 1 (Capital Efficiency): Sub-par ROCE ({roce}%) or ROE ({roe}%).")
 
-    # POINT 3: Sales Growth (Topline Expansion) - NEW
     pnl_df = tables.get("profit-loss")
     sales = extract_trend(pnl_df, "Sales")
     if sales and len(sales) >= 2:
@@ -128,7 +126,6 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             red_flags.append(f"🚨 Point 3 (Topline): Sales declined YoY by {sales_yoy:.1f}%.")
 
-    # POINT 4: Quarterly Results (OPM Expansion)
     q_df = tables.get("quarters")
     opm_trend = extract_trend(q_df, "OPM")
     if opm_trend and len(opm_trend) >= 4:
@@ -139,10 +136,8 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             reasons.append(f"⚠️ Point 4 (Quarterly Results): OPM margin trend is flat or contracting ({recent_opm[-1]}%).")
 
-    # POINT 5: Profit & Loss (YoY Growth & Consistency) - UPGRADED
     net_profit = extract_trend(pnl_df, "Net Profit")
     if net_profit:
-        # Check YoY Growth
         if len(net_profit) >= 2:
             profit_yoy = ((net_profit[-1] - net_profit[-2]) / abs(net_profit[-2])) * 100 if net_profit[-2] != 0 else 0
             if profit_yoy > 15:
@@ -151,13 +146,11 @@ def evaluate_fundamentals(data: dict) -> dict:
             elif profit_yoy < 0:
                 red_flags.append(f"🚨 Point 5 (Bottomline): Net Profit declined YoY by {profit_yoy:.1f}%.")
         
-        # Check Chronic Losses
         profitable_years = sum(1 for p in net_profit if p > 0)
         total_years = len(net_profit)
         if total_years > 0 and profitable_years <= (total_years / 2):
             red_flags.append(f"🚨 Point 5 (P&L): Chronic losses — profitable in only {profitable_years} of {total_years} years.")
 
-    # POINT 6: Balance Sheet (Reserves Trend)
     bs_df = tables.get("balance-sheet")
     reserves = extract_trend(bs_df, "Reserves")
     if reserves and len(reserves) >= 2:
@@ -167,7 +160,6 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append("✅ Point 6 (Balance Sheet): Reserves are expanding.")
 
-    # POINT 7: Cash Flow Statement 
     cf_df = tables.get("cash-flow")
     cfo = extract_trend(cf_df, "Operating Activity")
     if cfo:
@@ -178,7 +170,6 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append(f"✅ Point 7 (Cash Generation): Positive CFO in {positive_cfo} of {len(cfo)} recorded years.")
 
-    # POINT 8: Institutional Holding (Smart Money Accumulation) - NEW
     sh_df = tables.get("shareholding")
     fii = extract_trend(sh_df, "FIIs")
     dii = extract_trend(sh_df, "DIIs")
@@ -191,7 +182,6 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             reasons.append(f"⚠️ Point 8 (Smart Money): FII/DII stake decreased or remained flat at {inst_latest:.2f}%.")
 
-    # POINT 2: Shareholding Pattern (Promoter Trend)
     promoter = extract_trend(sh_df, "Promoters")
     if promoter and len(promoter) >= 4:
         if promoter[-1] < promoter[-4]:
@@ -200,7 +190,6 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append(f"✅ Point 2 (Shareholding): Stable promoter backing at {promoter[-1]}%.")
 
-    # Final Verdict Computation
     verdict = "WATCH"
     color = "orange"
     if red_flags:
@@ -230,19 +219,15 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 3. WEB SEARCH & AI LAYER (Bulk Deals Added)
+# 3. WEB SEARCH & AI LAYER (CASCADING FAILOVER)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_live_news(ticker: str) -> str:
     try:
-        # Search for General Business News
         news_results = DDGS().text(f"{ticker} stock news India latest business", max_results=3)
-        # Search specifically for Bulk / Block deals
         deals_results = DDGS().text(f"{ticker} bulk deal block deal NSE BSE latest", max_results=2)
-        
         news_text = "Recent News:\n" + "\n".join([f"- {r['title']}: {r['body']}" for r in news_results]) if news_results else ""
         deals_text = "\nBulk/Block Deals:\n" + "\n".join([f"- {r['title']}: {r['body']}" for r in deals_results]) if deals_results else ""
-        
         return news_text + "\n" + deals_text
     except Exception as e:
         return f"Web news bypassed: {str(e)}"
@@ -251,7 +236,7 @@ def is_rate_limit_error(exception):
     err_str = str(exception)
     return any(err in err_str for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
 
-@retry(wait=wait_random_exponential(multiplier=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception(is_rate_limit_error), reraise=True)
+@retry(wait=wait_random_exponential(multiplier=2, max=10), stop=stop_after_attempt(3), retry=retry_if_exception(is_rate_limit_error), reraise=True)
 def generate_content_with_backoff(client, prompt, config, model_name):
     return client.models.generate_content(model=model_name, contents=prompt, config=config)
 
@@ -264,7 +249,6 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) 
         live_news = fetch_live_news(ticker)
         client = genai.Client(api_key=api_key)
         
-        # PROMPT UPGRADED: Forces Streamlit :green[] and :red[] markdown for color coding
         prompt = f"""
 You are a senior institutional equity analyst. Evaluate this Indian stock: {ticker}.
 
@@ -286,20 +270,23 @@ CRITICAL FORMATTING INSTRUCTION:
 You MUST use Streamlit color markdown to highlight positives and negatives throughout your entire response:
 - Wrap all positive factors, strengths, and bull arguments in :green[text].
 - Wrap all negative factors, risks, red flags, and bear arguments in :red[text].
-Example: ":green[Consistent margin expansion] is offset by :red[heavy promoter pledging]."
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
         try:
+            # 1. ALWAYS TRY THE PRIMARY HIGH-CAPACITY MODEL FIRST
             response = generate_content_with_backoff(client, prompt, config, model_name='gemini-3.5-flash')
             return response.text
         except Exception as primary_error:
-            if "503" in str(primary_error) or "UNAVAILABLE" in str(primary_error):
+            # 2. CATCH QUOTA (429) OR CAPACITY (503) ERRORS
+            if any(err in str(primary_error) for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                st.warning("⚠️ Primary AI Quota Exhausted. Auto-routing to secondary Lite model...")
                 try:
-                    response_fallback = generate_content_with_backoff(client, prompt, config, model_name='gemini-2.5-flash')
+                    # 3. IMMEDIATELY FALLBACK TO FLASH-LITE (WHICH HAS A SEPARATE QUOTA BUCKET)
+                    response_fallback = generate_content_with_backoff(client, prompt, config, model_name='gemini-3.1-flash-lite')
                     return response_fallback.text
-                except Exception:
-                    st.error("⚠️ **Server Capacity Error**: Try again in 15 minutes.")
+                except Exception as fallback_error:
+                    st.error("⚠️ **Total Quota Exhausted**: Both primary and secondary models have reached their Free Tier limits for today.")
                     return "AI analysis could not be completed."
             else:
                 st.error(f"⚠️ **API Error**: {str(primary_error)}")
@@ -363,4 +350,4 @@ if st.button("Run Analysis") and ticker_input:
                     observations=eval_results["observations"]
                 )
             if ai_insight != "AI analysis could not be completed.":
-                st.markdown(ai_insight) # Changed from st.write to st.markdown to ensure color tags render properly
+                st.markdown(ai_insight)
