@@ -7,7 +7,6 @@ from google.genai import types
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 
 # -----------------------------------------
@@ -220,7 +219,7 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 3. WEB SEARCH & AI LAYER 
+# 3. WEB SEARCH & AI LAYER (CASCADING FAILOVER)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_live_news(ticker: str) -> str:
@@ -244,7 +243,7 @@ def generate_content_with_backoff(client, prompt, config, model_name):
 @st.cache_data(ttl=3600)
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
-    if not api_key: return "⚠️ Gemini API key not found. Please add to Streamlit Cloud Secrets."
+    if not api_key: return "⚠️ Gemini API key not found."
         
     try:
         live_news = fetch_live_news(ticker)
@@ -268,168 +267,108 @@ Task:
 4. Conclusion: A 3-bullet summary justifying BUY, SELL, AVOID, WATCH, or MULTIBAGGER.
 
 CRITICAL FORMATTING INSTRUCTION:
-You MUST use Streamlit color markdown to highlight positives and negatives:
+You MUST use Streamlit color markdown to highlight positives and negatives throughout your entire response:
 - Wrap all positive factors, strengths, and bull arguments in :green[text].
 - Wrap all negative factors, risks, red flags, and bear arguments in :red[text].
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
         try:
+            # 1. ALWAYS TRY THE PRIMARY HIGH-CAPACITY MODEL FIRST
             response = generate_content_with_backoff(client, prompt, config, model_name='gemini-3.5-flash')
             return response.text
         except Exception as primary_error:
+            # 2. CATCH QUOTA (429) OR CAPACITY (503) ERRORS
             if any(err in str(primary_error) for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                st.warning("⚠️ Primary AI Quota Exhausted. Auto-routing to secondary Lite model...")
                 try:
+                    # 3. IMMEDIATELY FALLBACK TO FLASH-LITE
                     response_fallback = generate_content_with_backoff(client, prompt, config, model_name='gemini-3.1-flash-lite')
                     return response_fallback.text
-                except Exception:
-                    return "⚠️ **Total Quota Exhausted**: Both primary and secondary models hit limits."
+                except Exception as fallback_error:
+                    st.error("⚠️ **Total Quota Exhausted**: Both primary and secondary models have reached their Free Tier limits for today.")
+                    return "AI analysis could not be completed."
             else:
-                return f"⚠️ **API Error**: {str(primary_error)}"
+                st.error(f"⚠️ **API Error**: {str(primary_error)}")
+                return "AI analysis could not be completed."
     except Exception as general_error:
-        return f"⚠️ **System Error**: {str(general_error)}"
+        st.error(f"⚠️ **System Error**: {str(general_error)}")
+        return "AI analysis could not be completed."
 
 # -----------------------------------------
-# 4. TECHNICAL SWING PULLBACK CHECKER
-# -----------------------------------------
-def check_technical_swing(ticker: str) -> dict:
-    try:
-        # Fetch 1 year of daily data for EMAs and RSI
-        yf_ticker = f"{ticker}.NS" 
-        df = yf.download(yf_ticker, period="1y", interval="1d", progress=False)
-        
-        if df.empty:
-            return {"error": f"Could not fetch technical data for {yf_ticker}."}
-        
-        # Squeeze dataframe if yfinance returns multi-level index
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-            
-        # 1. Calculate EMAs
-        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        
-        # 2. Calculate RSI (14-period)
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        
-        # 3. Get latest values
-        latest = df.iloc[-1]
-        close_price = float(latest['Close'])
-        open_price = float(latest['Open'])
-        low_price = float(latest['Low'])
-        ema_200 = float(latest['EMA_200'])
-        ema_50 = float(latest['EMA_50'])
-        rsi_14 = float(latest['RSI'])
-        
-        # 4. Strategy Logic
-        uptrend = close_price > ema_200
-        pullback = low_price <= ema_50
-        oversold = rsi_14 < 40
-        bullish = close_price > open_price
-        
-        signal = uptrend and pullback and oversold and bullish
-        
-        return {
-            "signal": signal,
-            "uptrend": uptrend,
-            "pullback": pullback,
-            "oversold": oversold,
-            "bullish": bullish,
-            "close": close_price,
-            "ema_200": ema_200,
-            "ema_50": ema_50,
-            "rsi": rsi_14
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# -----------------------------------------
-# 5. STREAMLIT UI DASHBOARD
+# 4. STREAMLIT UI DASHBOARD
 # -----------------------------------------
 st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="wide")
-st.title("Fundamental Screener & Swing Setup")
+st.title("Fundamental Screener")
 
 col_search, _ = st.columns([1, 2])
 with col_search:
-    ticker_input = st.text_input("🔍 Enter NSE Symbol (e.g., TATASTEEL, ITC):", "")
+    ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
 
-if st.button("Run Analysis") and ticker_input:
-    with st.spinner(f"Analyzing {ticker_input.upper()}..."):
+if st.button("Run Quantitative Analysis") and ticker_input:
+    with st.spinner(f"Fetching math and fundamentals for {ticker_input.upper()}..."):
         raw_data = fetch_screener_data(ticker_input)
         
     if "error" in raw_data:
         st.error(raw_data["error"])
     else:
-        eval_results = evaluate_fundamentals(raw_data)
-        metrics = eval_results["clean_metrics"]
-        
-        st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
-        st.progress(eval_results['score'] / 100)
-        st.caption(f"Health Score: {eval_results['score']}/100")
-        
-        cols = st.columns(6)
-        market_cap_formatted = f"{metrics['Market Cap (Cr)']:,.0f}"
-        cols[0].metric("Market Cap (Cr)", market_cap_formatted)
-        cols[1].metric("P/E", metrics["P/E"])
-        cols[2].metric("P/B", metrics["P/B"])
-        cols[3].metric("ROCE", f"{metrics['ROCE %']}%")
-        cols[4].metric("ROE", f"{metrics['ROE %']}%")
-        cols[5].metric("Debt/Equity", f"{metrics['D/E']}x")
-        st.divider()
+        # Store raw data in session state so we don't lose it when generating the AI report later
+        st.session_state['ticker'] = ticker_input
+        st.session_state['raw_data'] = raw_data
+        st.session_state['eval_results'] = evaluate_fundamentals(raw_data)
+        st.session_state['ai_insight_generated'] = False
 
-        # Added the 3rd Tab for Technical Swing Entry
-        tab1, tab2, tab3 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis", "🎯 Technical Swing Entry"])
+# Render the dashboard if data exists in session state
+if 'eval_results' in st.session_state:
+    eval_results = st.session_state['eval_results']
+    metrics = eval_results["clean_metrics"]
+    raw_data = st.session_state['raw_data']
+    ticker = st.session_state['ticker']
+    
+    st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
+    st.progress(eval_results['score'] / 100)
+    st.caption(f"Health Score: {eval_results['score']}/100")
+    
+    cols = st.columns(6)
+    market_cap_formatted = f"{metrics['Market Cap (Cr)']:,.0f}"
+    cols[0].metric("Market Cap (Cr)", market_cap_formatted)
+    cols[1].metric("P/E", metrics["P/E"])
+    cols[2].metric("P/B", metrics["P/B"])
+    cols[3].metric("ROCE", f"{metrics['ROCE %']}%")
+    cols[4].metric("ROE", f"{metrics['ROE %']}%")
+    cols[5].metric("Debt/Equity", f"{metrics['D/E']}x")
+    st.divider()
+
+    tab1, tab2 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis (On-Demand)"])
+    
+    with tab1:
+        if eval_results["flags"]:
+            st.error("🚨 Red Flags Triggered")
+            for flag in eval_results["flags"]:
+                st.write(flag)
         
-        with tab1:
-            if eval_results["flags"]:
-                st.error("🚨 Red Flags Triggered")
-                for flag in eval_results["flags"]:
-                    st.write(flag)
+        st.success("✅ Positive Observations")
+        for obs in eval_results["observations"]:
+            st.write(obs)
             
-            st.success("✅ Positive Observations")
-            for obs in eval_results["observations"]:
-                st.write(obs)
-                
-        with tab2:
-            with st.spinner("Synthesizing final investment thesis with color coding..."):
+    with tab2:
+        st.write("Generating an AI thesis consumes API quota. Ensure the fundamental metrics look promising before proceeding.")
+        
+        if eval_results["verdict"] == "AVOID / SELL":
+            st.warning("⚠️ This stock failed the quantitative screen. Running AI analysis is not recommended, but you can override below.")
+            
+        # The user must click this button to actually hit the Gemini API
+        if st.button("Generate Deep AI Thesis 🧠"):
+            with st.spinner("Fetching live news, bulk deals, and synthesizing final investment thesis..."):
                 ai_insight = get_ai_verdict(
                     ticker=raw_data["ticker"],
                     metrics=metrics,
                     flags=eval_results["flags"],
                     observations=eval_results["observations"]
                 )
-            if "⚠️" not in ai_insight:
-                st.markdown(ai_insight)
-            else:
-                st.error(ai_insight)
+                # Store the result in session state so it doesn't vanish if the user interacts with other parts of the app
+                st.session_state['ai_insight_generated'] = ai_insight
                 
-        with tab3:
-            st.subheader("Technical Pullback Check")
-            st.write("Verifying if this stock is in a macro uptrend but currently experiencing an oversold dip...")
-            
-            with st.spinner("Fetching daily technical data from Yahoo Finance..."):
-                tech_data = check_technical_swing(ticker_input)
-                
-            if "error" in tech_data:
-                st.error(tech_data["error"])
-            else:
-                t_cols = st.columns(4)
-                t_cols[0].metric("Current Price", f"₹{tech_data['close']:.2f}")
-                t_cols[1].metric("200 EMA (Macro Trend)", f"₹{tech_data['ema_200']:.2f}")
-                t_cols[2].metric("50 EMA (Pullback)", f"₹{tech_data['ema_50']:.2f}")
-                t_cols[3].metric("RSI (14)", f"{tech_data['rsi']:.1f}")
-                
-                st.markdown("### Conditions Checkout:")
-                st.write(f"{'✅' if tech_data['uptrend'] else '❌'} Price is above 200 EMA (Long-term Uptrend)")
-                st.write(f"{'✅' if tech_data['pullback'] else '❌'} Price pulled back to test 50 EMA")
-                st.write(f"{'✅' if tech_data['oversold'] else '❌'} RSI is oversold (< 40)")
-                st.write(f"{'✅' if tech_data['bullish'] else '❌'} Bullish Reversal (Close > Open today)")
-                
-                if tech_data['signal']:
-                    st.success("🎯 **SWING ENTRY TRIGGERED**: The stock has pulled back to a key support zone with washed-out momentum!")
-                else:
-                    st.warning("⏳ **NO ENTRY YET**: The technical setup is not perfectly aligned for a pullback entry.")
+        # Display the AI insight if it was successfully generated
+        if st.session_state.get('ai_insight_generated'):
+            st.markdown(st.session_state['ai_insight_generated'])
