@@ -15,15 +15,11 @@ from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_i
 @st.cache_data(ttl=3600)
 def fetch_screener_data(ticker: str) -> dict:
     clean_ticker = ticker.upper().strip().replace(" ", "")
-    
     urls = [
         f"https://www.screener.in/company/{clean_ticker}/consolidated/",
         f"https://www.screener.in/company/{clean_ticker}/"
     ]
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
     resp = None
     for url in urls:
@@ -37,7 +33,6 @@ def fetch_screener_data(ticker: str) -> dict:
     soup = BeautifulSoup(resp.content, "html.parser")
     data = {"ticker": clean_ticker, "tables": {}}
 
-    # Scrape Point 1: Quick Ratios snapshot bar
     ratio_items = soup.select("#top-ratios li")
     for li in ratio_items:
         name_elem = li.select_one(".name")
@@ -47,7 +42,6 @@ def fetch_screener_data(ticker: str) -> dict:
             val_clean = val_elem.text.strip().replace(",", "")
             data[name] = val_clean 
 
-    # Scrape Points 2, 4, 5, 6, 7: Deep HTML Tables
     table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding"]
     for tid in table_ids:
         div = soup.find(id=tid)
@@ -82,7 +76,7 @@ def extract_trend(df, keyword: str):
         return []
 
 # -----------------------------------------
-# 2. 10-POINT QUANTITATIVE SCORING ENGINE
+# 2. QUANTITATIVE SCORING ENGINE (Upgraded)
 # -----------------------------------------
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -93,12 +87,9 @@ def evaluate_fundamentals(data: dict) -> dict:
     tables = data.get("tables", {})
 
     def safe_float(val, default=0.0):
-        if val is None:
-            return default
-        try:
-            return float(str(val).replace(',', '').strip())
-        except (ValueError, TypeError):
-            return default
+        if val is None: return default
+        try: return float(str(val).replace(',', '').strip())
+        except (ValueError, TypeError): return default
 
     # POINT 1: Top Quick Ratios
     book_value = safe_float(data.get("book value"), 1.0)
@@ -109,11 +100,10 @@ def evaluate_fundamentals(data: dict) -> dict:
     roe = safe_float(data.get("roe"), 0.0)
     debt_equity = safe_float(data.get("debt to equity"), 0.0)
     pledge = safe_float(data.get("pledged percentage"), 0.0)
-    
     pb = (current_price / book_value) if book_value > 0 else 999.0
 
     if book_value <= 0:
-        red_flags.append("🚨 Point 6 (Balance Sheet): Negative Net Worth / Book Value is negative.")
+        red_flags.append("🚨 Point 1 (Balance Sheet): Negative Net Worth / Book Value is negative.")
     if pledge > 5.0:
         red_flags.append(f"🚨 Point 2 (Shareholding): Significant Promoter Pledge at {pledge}%.")
     if debt_equity > 1.5:
@@ -125,31 +115,49 @@ def evaluate_fundamentals(data: dict) -> dict:
     elif roce > 0 or roe > 0:
         reasons.append(f"⚠️ Point 1 (Capital Efficiency): Sub-par ROCE ({roce}%) or ROE ({roe}%).")
 
-    # POINT 4: Quarterly Results 
+    # POINT 3: Sales Growth (Topline Expansion) - NEW
+    pnl_df = tables.get("profit-loss")
+    sales = extract_trend(pnl_df, "Sales")
+    if sales and len(sales) >= 2:
+        sales_yoy = ((sales[-1] - sales[-2]) / abs(sales[-2])) * 100 if sales[-2] != 0 else 0
+        if sales_yoy > 15:
+            score += 10
+            reasons.append(f"✅ Point 3 (Topline): Excellent YoY Sales Growth of {sales_yoy:.1f}%.")
+        elif sales_yoy > 0:
+            reasons.append(f"⚠️ Point 3 (Topline): Moderate YoY Sales Growth of {sales_yoy:.1f}%.")
+        else:
+            red_flags.append(f"🚨 Point 3 (Topline): Sales declined YoY by {sales_yoy:.1f}%.")
+
+    # POINT 4: Quarterly Results (OPM Expansion)
     q_df = tables.get("quarters")
     opm_trend = extract_trend(q_df, "OPM")
     if opm_trend and len(opm_trend) >= 4:
         recent_opm = opm_trend[-4:]
         if recent_opm[-1] > recent_opm[0]:
             score += 15
-            reasons.append(f"✅ Point 4 (Quarterly Inflection): OPM expanded from {recent_opm[0]}% to {recent_opm[-1]}% over recent quarters.")
+            reasons.append(f"✅ Point 4 (Quarterly Inflection): OPM expanded from {recent_opm[0]}% to {recent_opm[-1]}% recently.")
         else:
             reasons.append(f"⚠️ Point 4 (Quarterly Results): OPM margin trend is flat or contracting ({recent_opm[-1]}%).")
 
-    # POINT 5: Profit & Loss 
-    pnl_df = tables.get("profit-loss")
+    # POINT 5: Profit & Loss (YoY Growth & Consistency) - UPGRADED
     net_profit = extract_trend(pnl_df, "Net Profit")
     if net_profit:
+        # Check YoY Growth
+        if len(net_profit) >= 2:
+            profit_yoy = ((net_profit[-1] - net_profit[-2]) / abs(net_profit[-2])) * 100 if net_profit[-2] != 0 else 0
+            if profit_yoy > 15:
+                score += 15
+                reasons.append(f"✅ Point 5 (Bottomline): Superb YoY Net Profit Growth of {profit_yoy:.1f}%.")
+            elif profit_yoy < 0:
+                red_flags.append(f"🚨 Point 5 (Bottomline): Net Profit declined YoY by {profit_yoy:.1f}%.")
+        
+        # Check Chronic Losses
         profitable_years = sum(1 for p in net_profit if p > 0)
         total_years = len(net_profit)
-        if total_years > 0:
-            if profitable_years <= (total_years / 2):
-                red_flags.append(f"🚨 Point 5 (P&L): Chronic losses detected — profitable in only {profitable_years} of {total_years} years.")
-            elif profitable_years >= total_years - 1:
-                score += 15
-                reasons.append(f"✅ Point 5 (P&L Consistency): Profitable in {profitable_years} of {total_years} recorded years.")
+        if total_years > 0 and profitable_years <= (total_years / 2):
+            red_flags.append(f"🚨 Point 5 (P&L): Chronic losses — profitable in only {profitable_years} of {total_years} years.")
 
-    # POINT 6: Balance Sheet 
+    # POINT 6: Balance Sheet (Reserves Trend)
     bs_df = tables.get("balance-sheet")
     reserves = extract_trend(bs_df, "Reserves")
     if reserves and len(reserves) >= 2:
@@ -170,8 +178,20 @@ def evaluate_fundamentals(data: dict) -> dict:
             score += 10
             reasons.append(f"✅ Point 7 (Cash Generation): Positive CFO in {positive_cfo} of {len(cfo)} recorded years.")
 
-    # POINT 2: Shareholding Pattern 
+    # POINT 8: Institutional Holding (Smart Money Accumulation) - NEW
     sh_df = tables.get("shareholding")
+    fii = extract_trend(sh_df, "FIIs")
+    dii = extract_trend(sh_df, "DIIs")
+    if fii and dii and len(fii) >= 2 and len(dii) >= 2:
+        inst_latest = fii[-1] + dii[-1]
+        inst_prev = fii[-2] + dii[-2]
+        if inst_latest > inst_prev:
+            score += 15
+            reasons.append(f"✅ Point 8 (Smart Money): FII/DII accumulating, total stake increased to {inst_latest:.2f}%.")
+        else:
+            reasons.append(f"⚠️ Point 8 (Smart Money): FII/DII stake decreased or remained flat at {inst_latest:.2f}%.")
+
+    # POINT 2: Shareholding Pattern (Promoter Trend)
     promoter = extract_trend(sh_df, "Promoters")
     if promoter and len(promoter) >= 4:
         if promoter[-1] < promoter[-4]:
@@ -186,10 +206,10 @@ def evaluate_fundamentals(data: dict) -> dict:
     if red_flags:
         verdict = "AVOID / SELL"
         color = "red"
-    elif score >= 60 and pb <= 6.0:
+    elif score >= 75 and pb <= 6.0:
         verdict = "MULTIBAGGER CANDIDATE / BUY"
         color = "green"
-    elif score >= 40:
+    elif score >= 50:
         verdict = "BUY (Steady Compounder)"
         color = "blue"
 
@@ -210,15 +230,20 @@ def evaluate_fundamentals(data: dict) -> dict:
     }
 
 # -----------------------------------------
-# 3. WEB SEARCH & AI LAYER (Reinforced Retry Loop)
+# 3. WEB SEARCH & AI LAYER (Bulk Deals Added)
 # -----------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_live_news(ticker: str) -> str:
     try:
-        results = DDGS().text(f"{ticker} stock news India latest business update", max_results=5)
-        if not results:
-            return "No recent news headlines found."
-        return "Recent Business & Market News:\n" + "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+        # Search for General Business News
+        news_results = DDGS().text(f"{ticker} stock news India latest business", max_results=3)
+        # Search specifically for Bulk / Block deals
+        deals_results = DDGS().text(f"{ticker} bulk deal block deal NSE BSE latest", max_results=2)
+        
+        news_text = "Recent News:\n" + "\n".join([f"- {r['title']}: {r['body']}" for r in news_results]) if news_results else ""
+        deals_text = "\nBulk/Block Deals:\n" + "\n".join([f"- {r['title']}: {r['body']}" for r in deals_results]) if deals_results else ""
+        
+        return news_text + "\n" + deals_text
     except Exception as e:
         return f"Web news bypassed: {str(e)}"
 
@@ -226,45 +251,42 @@ def is_rate_limit_error(exception):
     err_str = str(exception)
     return any(err in err_str for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
 
-@retry(
-    wait=wait_random_exponential(multiplier=2, max=60),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception(is_rate_limit_error),
-    reraise=True
-)
+@retry(wait=wait_random_exponential(multiplier=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception(is_rate_limit_error), reraise=True)
 def generate_content_with_backoff(client, prompt, config, model_name):
-    return client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=config
-    )
+    return client.models.generate_content(model=model_name, contents=prompt, config=config)
 
 @st.cache_data(ttl=3600)
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
-    if not api_key:
-        return "⚠️ Gemini API key not found. Please add `GEMINI_API_KEY` to `.streamlit/secrets.toml`."
+    if not api_key: return "⚠️ Gemini API key not found."
         
     try:
         live_news = fetch_live_news(ticker)
         client = genai.Client(api_key=api_key)
         
+        # PROMPT UPGRADED: Forces Streamlit :green[] and :red[] markdown for color coding
         prompt = f"""
 You are a senior institutional equity analyst. Evaluate this Indian stock: {ticker}.
 
-Quantitative Scorecard (Points 1, 2, 4, 5, 6, 7):
+Quantitative Scorecard:
 - Metrics: {metrics}
 - Detected Red Flags: {flags}
 - Trend Observations: {observations}
 
-Live Market & Concall Context (Points 3, 9, 10):
+Live Market & Bulk Deals:
 {live_news}
 
 Task:
-1. Peer & Industry Standing (Point 3): Compare its competitive moat against sector peers based on your knowledge.
-2. Governance & Catalysts (Point 9): Highlight any corporate governance warnings, credit rating notes, or management concall updates from recent events.
-3. Multibagger Inflection Thesis (Point 10): Is there an active catalyst (e.g., massive capex, margin inflection, new order books) or is it a steady compounder?
-4. Conclude with a strict 3-bullet summary justifying BUY, SELL, AVOID, WATCH, or MULTIBAGGER.
+1. Peer & Industry Standing: Compare its competitive moat against sector peers.
+2. Governance & Catalysts: Highlight management updates, credit rating notes, or recent bulk/block deals.
+3. Multibagger Inflection Thesis: Is there an active catalyst (capex, margin inflection) or is it a steady compounder?
+4. Conclusion: A 3-bullet summary justifying BUY, SELL, AVOID, WATCH, or MULTIBAGGER.
+
+CRITICAL FORMATTING INSTRUCTION:
+You MUST use Streamlit color markdown to highlight positives and negatives throughout your entire response:
+- Wrap all positive factors, strengths, and bull arguments in :green[text].
+- Wrap all negative factors, risks, red flags, and bear arguments in :red[text].
+Example: ":green[Consistent margin expansion] is offset by :red[heavy promoter pledging]."
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
@@ -287,13 +309,11 @@ Task:
         return "AI analysis could not be completed."
 
 # -----------------------------------------
-# 4. STREAMLIT UI DASHBOARD (Clean & Minimalist)
+# 4. STREAMLIT UI DASHBOARD
 # -----------------------------------------
 st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="wide")
-
 st.title("Fundamental Screener")
 
-# Keep the search bar compact
 col_search, _ = st.columns([1, 2])
 with col_search:
     ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
@@ -308,24 +328,20 @@ if st.button("Run Analysis") and ticker_input:
         eval_results = evaluate_fundamentals(raw_data)
         metrics = eval_results["clean_metrics"]
         
-        # Clean minimalist header for the verdict
         st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
+        st.progress(eval_results['score'] / 100)
         st.caption(f"Health Score: {eval_results['score']}/100")
         
-        # Quick Ratios formatted cleanly
         cols = st.columns(6)
         market_cap_formatted = f"{metrics['Market Cap (Cr)']:,.0f}"
-        
         cols[0].metric("Market Cap (Cr)", market_cap_formatted)
         cols[1].metric("P/E", metrics["P/E"])
         cols[2].metric("P/B", metrics["P/B"])
         cols[3].metric("ROCE", f"{metrics['ROCE %']}%")
         cols[4].metric("ROE", f"{metrics['ROE %']}%")
         cols[5].metric("Debt/Equity", f"{metrics['D/E']}x")
-
         st.divider()
 
-        # Tabs separate the dense text so the main view isn't cluttered
         tab1, tab2 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis"])
         
         with tab1:
@@ -339,7 +355,7 @@ if st.button("Run Analysis") and ticker_input:
                 st.write(obs)
                 
         with tab2:
-            with st.spinner("Synthesizing final investment thesis..."):
+            with st.spinner("Synthesizing final investment thesis with color coding..."):
                 ai_insight = get_ai_verdict(
                     ticker=raw_data["ticker"],
                     metrics=metrics,
@@ -347,4 +363,4 @@ if st.button("Run Analysis") and ticker_input:
                     observations=eval_results["observations"]
                 )
             if ai_insight != "AI analysis could not be completed.":
-                st.write(ai_insight)
+                st.markdown(ai_insight) # Changed from st.write to st.markdown to ensure color tags render properly
