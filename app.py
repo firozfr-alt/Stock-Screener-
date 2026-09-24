@@ -222,7 +222,6 @@ def fetch_live_news(ticker: str) -> str:
     except Exception as e:
         return f"Web news bypassed: {str(e)}"
 
-# --- EXPONENTIAL BACKOFF LOGIC ---
 def is_rate_limit_error(exception):
     err_str = str(exception)
     return any(err in err_str for err in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
@@ -233,10 +232,9 @@ def is_rate_limit_error(exception):
     retry=retry_if_exception(is_rate_limit_error),
     reraise=True
 )
-def generate_content_with_backoff(client, prompt, config):
-    # FIXED: Updated to the correct active model string for the Gemini 3 framework
+def generate_content_with_backoff(client, prompt, config, model_name):
     return client.models.generate_content(
-        model='gemini-3.5-flash',
+        model=model_name,
         contents=prompt,
         config=config
     )
@@ -245,7 +243,7 @@ def generate_content_with_backoff(client, prompt, config):
 def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", None)
     if not api_key:
-        return "⚠️ Gemini API key not found. Please add `GEMINI_API_KEY` to `.streamlit/secrets.toml` or Streamlit Cloud Secrets."
+        return "⚠️ Gemini API key not found. Please add `GEMINI_API_KEY` to `.streamlit/secrets.toml`."
         
     try:
         live_news = fetch_live_news(ticker)
@@ -270,28 +268,38 @@ Task:
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
-        response = generate_content_with_backoff(client, prompt, config)
-        return response.text
-        
-    except Exception as e:
-        err_str = str(e)
-        # Using st.error here instead of returning a string prevents Streamlit from successfully caching the failure
-        st.error(f"⚠️ **API Constraint/Error**: Request failed. {err_str}")
+        try:
+            response = generate_content_with_backoff(client, prompt, config, model_name='gemini-3.5-flash')
+            return response.text
+        except Exception as primary_error:
+            if "503" in str(primary_error) or "UNAVAILABLE" in str(primary_error):
+                try:
+                    response_fallback = generate_content_with_backoff(client, prompt, config, model_name='gemini-2.5-flash')
+                    return response_fallback.text
+                except Exception:
+                    st.error("⚠️ **Server Capacity Error**: Try again in 15 minutes.")
+                    return "AI analysis could not be completed."
+            else:
+                st.error(f"⚠️ **API Error**: {str(primary_error)}")
+                return "AI analysis could not be completed."
+    except Exception as general_error:
+        st.error(f"⚠️ **System Error**: {str(general_error)}")
         return "AI analysis could not be completed."
 
 # -----------------------------------------
-# 4. STREAMLIT UI DASHBOARD
+# 4. STREAMLIT UI DASHBOARD (Clean & Minimalist)
 # -----------------------------------------
 st.set_page_config(page_title="Fundamental Screener", page_icon="📈", layout="wide")
 
 st.title("Fundamental Screener")
 
+# Keep the search bar compact
 col_search, _ = st.columns([1, 2])
 with col_search:
     ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
 
 if st.button("Run Analysis") and ticker_input:
-    with st.spinner(f"Scraping Screener.in tables and metrics for {ticker_input.upper()}..."):
+    with st.spinner(f"Analyzing {ticker_input.upper()}..."):
         raw_data = fetch_screener_data(ticker_input)
         
     if "error" in raw_data:
@@ -300,14 +308,12 @@ if st.button("Run Analysis") and ticker_input:
         eval_results = evaluate_fundamentals(raw_data)
         metrics = eval_results["clean_metrics"]
         
-        st.markdown(f"<h2 style='text-align: center; color: {eval_results['color']};'>VERDICT: {eval_results['verdict']}</h2>", unsafe_allow_html=True)
-        st.progress(eval_results['score'] / 100)
-        st.caption(f"Quantitative Health Score: {eval_results['score']}/100")
+        # Clean minimalist header for the verdict
+        st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
+        st.caption(f"Health Score: {eval_results['score']}/100")
         
-        st.subheader("Point 1: Top Quick Ratios")
+        # Quick Ratios formatted cleanly
         cols = st.columns(6)
-        
-        # Formatted Market Cap to drop the trailing decimals
         market_cap_formatted = f"{metrics['Market Cap (Cr)']:,.0f}"
         
         cols[0].metric("Market Cap (Cr)", market_cap_formatted)
@@ -317,19 +323,23 @@ if st.button("Run Analysis") and ticker_input:
         cols[4].metric("ROE", f"{metrics['ROE %']}%")
         cols[5].metric("Debt/Equity", f"{metrics['D/E']}x")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Points 2, 4, 5, 6, 7: Table & Trend Audit")
-            for obs in eval_results["observations"]:
-                st.write(obs)
+        st.divider()
+
+        # Tabs separate the dense text so the main view isn't cluttered
+        tab1, tab2 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis"])
+        
+        with tab1:
             if eval_results["flags"]:
-                st.error("🚨 RED FLAGS TRIGGERED")
+                st.error("🚨 Red Flags Triggered")
                 for flag in eval_results["flags"]:
                     st.write(flag)
-        
-        with col2:
-            st.subheader("Points 3, 9, 10: AI Peer, Catalyst & Inflection Thesis")
-            with st.spinner("Analyzing news and synthesizing final investment thesis..."):
+            
+            st.success("✅ Positive Observations")
+            for obs in eval_results["observations"]:
+                st.write(obs)
+                
+        with tab2:
+            with st.spinner("Synthesizing final investment thesis..."):
                 ai_insight = get_ai_verdict(
                     ticker=raw_data["ticker"],
                     metrics=metrics,
@@ -337,4 +347,4 @@ if st.button("Run Analysis") and ticker_input:
                     observations=eval_results["observations"]
                 )
             if ai_insight != "AI analysis could not be completed.":
-                st.info(ai_insight)
+                st.write(ai_insight)
