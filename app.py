@@ -42,7 +42,8 @@ def fetch_screener_data(ticker: str) -> dict:
             val_clean = val_elem.text.strip().replace(",", "")
             data[name] = val_clean 
 
-    table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding"]
+    # Included "ratios" to capture Debtor Days and Working Capital
+    table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding", "ratios"]
     for tid in table_ids:
         div = soup.find(id=tid)
         if div:
@@ -68,7 +69,7 @@ def extract_trend(df, keyword: str):
     except Exception: return []
 
 # ==========================================
-# 2. QUANTITATIVE SCORING WITH CIRCUIT BREAKERS
+# 2. ADVANCED QUANTITATIVE SCORING ENGINE
 # ==========================================
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -113,15 +114,46 @@ def evaluate_fundamentals(data: dict) -> dict:
         if sales_yoy > 15: pos_flags.append(f"✅ Topline: Excellent YoY Sales Growth of {sales_yoy:.1f}%.")
         elif sales_yoy < 0: neg_flags.append(f"🚨 Topline: Sales declined YoY by {sales_yoy:.1f}%.")
 
-    # 4. Cash Flow
+    # 4. Earnings Quality (CFO vs PAT) & Free Cash Flow (FCF)
     cf_df = tables.get("cash-flow")
-    cfo = extract_trend(cf_df, "Operating Activity")
-    if cfo:
-        positive_cfo = sum(1 for c in cfo if c > 0)
-        if positive_cfo < len(cfo) / 2: neg_flags.append("🚨 Cash Flow: Operating cash flow is negative in most reported periods.")
-        else: pos_flags.append(f"✅ Cash Generation: Positive CFO in {positive_cfo} of {len(cfo)} recorded years.")
+    net_profit_trend = extract_trend(pnl_df, "Net Profit")
+    cfo_trend = extract_trend(cf_df, "Operating Activity")
+    capex_trend = extract_trend(cf_df, "Fixed assets purchased")
 
-    # 5. Shareholding & Regulatory Overhang
+    if net_profit_trend and cfo_trend:
+        # Check last 3 years cash conversion
+        min_len = min(len(net_profit_trend), len(cfo_trend), 3)
+        if min_len >= 3:
+            sum_pat = sum(net_profit_trend[-min_len:])
+            sum_cfo = sum(cfo_trend[-min_len:])
+            
+            if sum_pat > 0:
+                cfo_pat_ratio = sum_cfo / sum_pat
+                if cfo_pat_ratio < 0.5:
+                    neg_flags.append(f"🚨 Earnings Quality: Poor cash conversion. 3-Yr CFO is only {cfo_pat_ratio*100:.0f}% of Net Profit (Paper Profits).")
+                elif cfo_pat_ratio >= 0.8:
+                    pos_flags.append(f"✅ Earnings Quality: Strong cash conversion (3-Yr CFO is {cfo_pat_ratio*100:.0f}% of Net Profit).")
+
+        # Check latest Free Cash Flow (CFO - Capex)
+        if capex_trend:
+            recent_cfo = cfo_trend[-1]
+            recent_capex = capex_trend[-1]
+            fcf = recent_cfo - abs(recent_capex)
+            if fcf < 0:
+                neg_flags.append(f"⚠️ Free Cash Flow: Negative FCF (₹{fcf:.0f} Cr). Operations aren't covering capex requirements.")
+            else:
+                pos_flags.append(f"✅ Free Cash Flow: Generating positive FCF (₹{fcf:.0f} Cr) after reinvestment.")
+
+    # 5. Working Capital Red Flags
+    ratios_df = tables.get("ratios")
+    debtor_days = extract_trend(ratios_df, "Debtor Days")
+    if debtor_days and len(debtor_days) >= 2:
+        if debtor_days[-2] > 0 and (debtor_days[-1] / debtor_days[-2]) > 1.3:
+            neg_flags.append(f"🚨 Working Capital: Debtor days spiked {debtor_days[-2]} ➔ {debtor_days[-1]} days. (High channel stuffing risk).")
+        elif debtor_days[-1] < 45:
+            pos_flags.append(f"✅ Working Capital: Efficient cash collection cycle ({debtor_days[-1]} Debtor Days).")
+
+    # 6. Shareholding & Regulatory Overhang
     sh_df = tables.get("shareholding")
     promoter = extract_trend(sh_df, "Promoters")
     current_promoter_holding = 0
@@ -132,7 +164,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             pos_flags.append(f"✅ Stable promoter backing at {current_promoter_holding}%.")
 
-    # --- THE CIRCUIT BREAKERS (Fixing the false "BUY" ratings) ---
+    # --- THE CIRCUIT BREAKERS ---
     if pe_ratio > 80 and roce < 15:
         verdict = "HIGH RISK (Overvalued Momentum)"
         color = "red"
@@ -146,7 +178,6 @@ def evaluate_fundamentals(data: dict) -> dict:
         verdict = "HOLD (Mixed Signals)"
         color = "gray"
 
-    # Edge Case Overrides
     if len(neg_flags) >= 4:
         verdict = "AVOID / SELL"
         color = "red"
@@ -190,7 +221,6 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list, 
         live_news = fetch_live_news(ticker)
         client = genai.Client(api_key=api_key)
         
-        # Calculate Overhang data for the prompt
         overhang_pct = max(0.0, promoter_holding - 75.0)
         overhang_cr = (overhang_pct / 100) * metrics.get("Market Cap (Cr)", 0)
         
@@ -264,7 +294,7 @@ if 'eval_results' in st.session_state:
     tab1, tab2 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis (On-Demand)"])
     
     with tab1:
-        # FIX: STRICT UI SEGREGATION
+        # STRICT UI SEGREGATION
         ui_col1, ui_col2 = st.columns(2)
         
         with ui_col1:
@@ -274,7 +304,7 @@ if 'eval_results' in st.session_state:
                 st.write(obs)
                 
         with ui_col2:
-            st.error("⚠️️ Risk Factors (Friction & Valuation)")
+            st.error("⚠️ Risk Factors (Friction & Valuation)")
             if not eval_results["flags"]: st.write("None found.")
             for flag in eval_results["flags"]:
                 st.write(flag)
