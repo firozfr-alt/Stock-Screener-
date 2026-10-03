@@ -40,7 +40,7 @@ def fetch_screener_data(ticker: str) -> dict:
         val_elem = li.select_one(".value") or li.select_one(".nowrap")
         if name_elem and val_elem:
             name = name_elem.text.strip().lower()
-            val_clean = val_elem.text.strip().replace(",", "").replace("₹", "").strip()
+            val_clean = val_elem.text.strip().replace(",", "").replace("₹", "").replace("Rs.", "").strip()
             data[name] = val_clean 
 
     table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding", "ratios"]
@@ -54,15 +54,26 @@ def fetch_screener_data(ticker: str) -> dict:
 
     return data
 
-def extract_trend(df, keyword: str):
+def extract_trend(df, keyword: str, exclude_ttm: bool = False):
+    """
+    Extracts time-series rows while optionally filtering out the 'TTM' column 
+    to maintain strict fiscal-year alignment with Cash Flow statements.
+    """
     if df is None or df.empty: 
         return []
     try:
         row = df[df.iloc[:, 0].astype(str).str.contains(keyword, case=False, na=False)]
         if row.empty: 
             return []
+        
+        cols = list(df.columns[1:])
+        row_vals = row.iloc[0, 1:]
+        
         vals = []
-        for val in row.iloc[0, 1:].values:
+        for col, val in zip(cols, row_vals):
+            # Temporal fix: Ignore TTM when comparing historical fiscal years with Cash Flow
+            if exclude_ttm and "ttm" in str(col).lower():
+                continue
             clean = str(val).replace(',', '').replace('%', '').strip()
             if clean not in ['-', '', 'nan', 'NaN', 'None']:
                 try: 
@@ -74,7 +85,7 @@ def extract_trend(df, keyword: str):
         return []
 
 # ==========================================
-# 2. ADVANCED INFLECTION & BREAKOUT ENGINE
+# 2. ADVANCED INFLECTION & AUDITING ENGINE
 # ==========================================
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -91,7 +102,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         except (ValueError, TypeError): 
             return default
 
-    # Core Ratios
+    # Core Financial Metrics
     book_value = safe_float(data.get("book value"), 1.0)
     current_price = safe_float(data.get("current price"), 0.0)
     market_cap = safe_float(data.get("market cap"), 0.0)
@@ -102,20 +113,24 @@ def evaluate_fundamentals(data: dict) -> dict:
     pledge = safe_float(data.get("pledged percentage"), 0.0)
     pb = (current_price / book_value) if book_value > 0 else 999.0
 
-    # 1. 52-Week High / Low & Breakout Proximity Analysis
+    # 1. 52-Week High / Low & Breakout Proximity
     high_52w, low_52w = 0.0, 0.0
     drawdown_pct = 0.0
     breakout_proximity_pct = 0.0
     high_low_str = data.get("high / low", "")
     if "/" in high_low_str:
         parts = high_low_str.split("/")
-        high_52w = safe_float(parts[0].strip(), 0.0)
-        low_52w = safe_float(parts[1].strip(), 0.0)
+        def clean_val(s):
+            clean = s.replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+            try: return float(clean)
+            except: return 0.0
+        high_52w = clean_val(parts[0])
+        low_52w = clean_val(parts[1]) if len(parts) > 1 else 0.0
         if high_52w > 0 and current_price > 0:
-            drawdown_pct = ((high_52w - current_price) / high_52w) * 100.0
-            breakout_proximity_pct = (current_price / high_52w) * 100.0
+            drawdown_pct = max(0.0, ((high_52w - current_price) / high_52w) * 100.0)
+            breakout_proximity_pct = min(100.0, (current_price / high_52w) * 100.0)
 
-    # 2. Solvency & Balance Sheet Integrity
+    # 2. Solvency & Debt Servicing (Interest Coverage Check)
     if book_value <= 0: 
         neg_flags.append("🚨 Balance Sheet: Negative Net Worth / Book Value.")
     if pledge > 5.0: 
@@ -123,16 +138,25 @@ def evaluate_fundamentals(data: dict) -> dict:
     if debt_equity > 1.5: 
         neg_flags.append(f"🚨 Solvency: Elevated Debt-to-Equity at {debt_equity}x.")
     elif debt_equity < 0.3: 
-        pos_flags.append(f"✅ Balance Sheet Fortress: Ultra-low D/E of {debt_equity}x provides strong downside protection.")
+        pos_flags.append(f"✅ Balance Sheet Fortress: Ultra-low D/E of {debt_equity}x.")
 
-    # 3. Capital Efficiency (Current & Multi-Year Resilience)
+    pnl_df = tables.get("profit-loss")
+    op_profit = extract_trend(pnl_df, "Operating Profit")
+    interest = extract_trend(pnl_df, "Interest")
+    if op_profit and interest and interest[-1] > 0:
+        interest_coverage = op_profit[-1] / interest[-1]
+        if interest_coverage < 2.5:
+            neg_flags.append(f"🚨 Debt Servicing: Low Interest Coverage ({interest_coverage:.1f}x < 2.5x). Vulnerable if earnings soften.")
+        elif interest_coverage >= 5.0:
+            pos_flags.append(f"✅ Debt Servicing: Strong Interest Coverage ({interest_coverage:.1f}x).")
+
+    # 3. Capital Efficiency Checks
     if roce >= 15.0 and roe >= 15.0:
-        pos_flags.append(f"✅ Capital Efficiency: High compounding returns — ROCE {roce}%, ROE {roe}%.")
+        pos_flags.append(f"✅ Capital Efficiency: Robust compounding returns — ROCE {roce}%, ROE {roe}%.")
     elif roce < 10.0:
         neg_flags.append(f"⚠️ Capital Efficiency: Trough or sub-par return ratios — ROCE {roce}%, ROE {roe}%.")
 
-    # 4. Operating Leverage & Growth Inflection (Sales vs PAT Acceleration)
-    pnl_df = tables.get("profit-loss")
+    # 4. Annual Operating Leverage (Sales vs PAT Acceleration)
     sales = extract_trend(pnl_df, "Sales")
     net_profit = extract_trend(pnl_df, "Net Profit")
     sales_yoy, pat_yoy = 0.0, 0.0
@@ -142,15 +166,36 @@ def evaluate_fundamentals(data: dict) -> dict:
     if net_profit and len(net_profit) >= 2:
         pat_yoy = ((net_profit[-1] - net_profit[-2]) / abs(net_profit[-2])) * 100 if net_profit[-2] != 0 else 0.0
 
-    # Operating Leverage Detection: Profits accelerating significantly faster than sales
     if pat_yoy > 25.0 and pat_yoy > (sales_yoy * 1.5):
-        pos_flags.append(f"🚀 Operating Leverage Active: PAT grew {pat_yoy:.1f}% vs Sales growth of {sales_yoy:.1f}%.")
+        pos_flags.append(f"🚀 Annual Operating Leverage: PAT surged {pat_yoy:.1f}% vs Sales growth of {sales_yoy:.1f}%.")
     elif sales_yoy > 15.0:
-        pos_flags.append(f"✅ Topline Momentum: Solid YoY Sales Growth of {sales_yoy:.1f}%.")
+        pos_flags.append(f"✅ Annual Topline: Solid YoY Sales Growth of {sales_yoy:.1f}%.")
     elif sales_yoy < -5.0:
-        neg_flags.append(f"🚨 Topline Drag: Sales contracted YoY by {sales_yoy:.1f}%.")
+        neg_flags.append(f"🚨 Topline Drag: Annual sales contracted YoY by {sales_yoy:.1f}%.")
 
-    # 5. J-Curve Catalyst: CWIP to Fixed Assets Shift (Upcoming Capex Monetization)
+    # 5. Real-Time Quarterly Inflection Check
+    q_df = tables.get("quarters")
+    q_sales = extract_trend(q_df, "Sales")
+    q_pat = extract_trend(q_df, "Net Profit")
+    q_opm = extract_trend(q_df, "OPM")
+    
+    q_sales_yoy, q_pat_yoy = 0.0, 0.0
+    if q_sales and len(q_sales) >= 5:
+        q_sales_yoy = ((q_sales[-1] - q_sales[-5]) / abs(q_sales[-5])) * 100 if q_sales[-5] != 0 else 0.0
+    if q_pat and len(q_pat) >= 5:
+        q_pat_yoy = ((q_pat[-1] - q_pat[-5]) / abs(q_pat[-5])) * 100 if q_pat[-5] != 0 else 0.0
+        
+    if q_pat_yoy > 30.0 and q_sales_yoy > 15.0:
+        pos_flags.append(f"🔥 Quarterly Inflection: Latest Qtr PAT surged {q_pat_yoy:.1f}% YoY on {q_sales_yoy:.1f}% Sales growth.")
+    elif q_pat_yoy < -20.0:
+        neg_flags.append(f"⚠️ Quarterly Deterioration: Latest Qtr PAT dropped {q_pat_yoy:.1f}% YoY.")
+
+    if q_opm and len(q_opm) >= 4:
+        recent_opm = q_opm[-4:]
+        if recent_opm[-1] > recent_opm[0]:
+            pos_flags.append(f"✅ Margin Expansion: OPM expanded from {recent_opm[0]}% to {recent_opm[-1]}% across recent quarters.")
+
+    # 6. J-Curve Catalyst: CWIP to Fixed Assets
     bs_df = tables.get("balance-sheet")
     cwip_trend = extract_trend(bs_df, "CWIP") or extract_trend(bs_df, "Capital Work in Progress")
     fixed_assets_trend = extract_trend(bs_df, "Fixed assets")
@@ -159,27 +204,27 @@ def evaluate_fundamentals(data: dict) -> dict:
     if cwip_trend and fixed_assets_trend and fixed_assets_trend[-1] > 0:
         cwip_ratio = (cwip_trend[-1] / fixed_assets_trend[-1]) * 100.0
         if cwip_ratio >= 15.0:
-            pos_flags.append(f"🏭 Capex Inflection (J-Curve): CWIP stands at {cwip_ratio:.1f}% of Fixed Assets (Capacity expansion nearing completion).")
+            pos_flags.append(f"🏭 Capex Inflection (J-Curve): CWIP is {cwip_ratio:.1f}% of Fixed Assets (Upcoming capacity expansion).")
 
-    # 6. Forensic Checks: Earnings Quality & Free Cash Flow
+    # 7. Forensic Checks: Earnings Quality (Strict Fiscal Year Alignment)
     cf_df = tables.get("cash-flow")
-    cfo_trend = extract_trend(cf_df, "Operating Activity")
-    capex_trend = extract_trend(cf_df, "Fixed assets purchased")
+    net_profit_annual = extract_trend(pnl_df, "Net Profit", exclude_ttm=True)
+    cfo_annual = extract_trend(cf_df, "Operating Activity")
 
     cfo_pat_ratio = 1.0
-    if net_profit and cfo_trend:
-        min_len = min(len(net_profit), len(cfo_trend), 3)
+    if net_profit_annual and cfo_annual:
+        min_len = min(len(net_profit_annual), len(cfo_annual), 3)
         if min_len >= 3:
-            sum_pat = sum(net_profit[-min_len:])
-            sum_cfo = sum(cfo_trend[-min_len:])
+            sum_pat = sum(net_profit_annual[-min_len:])
+            sum_cfo = sum(cfo_annual[-min_len:])
             if sum_pat > 0:
                 cfo_pat_ratio = sum_cfo / sum_pat
                 if cfo_pat_ratio < 0.5:
-                    neg_flags.append(f"🚨 Earnings Quality: 3-Yr cumulative CFO is only {cfo_pat_ratio*100:.0f}% of Net Profit (Paper profits).")
+                    neg_flags.append(f"🚨 Earnings Quality: 3-Yr cumulative CFO is only {cfo_pat_ratio*100:.0f}% of PAT (Paper profits).")
                 elif cfo_pat_ratio >= 0.8:
-                    pos_flags.append(f"✅ Cash Conversion: Strong cash generation (3-Yr CFO is {cfo_pat_ratio*100:.0f}% of Net Profit).")
+                    pos_flags.append(f"✅ Cash Conversion: Reliable conversion (3-Yr CFO is {cfo_pat_ratio*100:.0f}% of PAT).")
 
-    # 7. Institutional Stealth Accumulation vs Price Position
+    # 8. Institutional Smart Money Movement
     sh_df = tables.get("shareholding")
     fii = extract_trend(sh_df, "FIIs")
     dii = extract_trend(sh_df, "DIIs")
@@ -193,7 +238,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         elif (inst_prev - inst_latest) > 2.0:
             neg_flags.append(f"⚠️️ Institutional Outflow: Smart money trimmed stake by {inst_prev - inst_latest:.2f}%.")
 
-    # 8. Shareholding & Regulatory Overhang
+    # 9. Promoter Ownership & SEBI MPS Limit
     promoter = extract_trend(sh_df, "Promoters")
     current_promoter_holding = 0.0
     if promoter and len(promoter) >= 1:
@@ -203,27 +248,30 @@ def evaluate_fundamentals(data: dict) -> dict:
         else:
             pos_flags.append(f"✅ Stable promoter holding at {current_promoter_holding}%.")
 
-    # --- ADVANCED DUAL-ENGINE VERDICT CLASSIFICATION ---
+    # --- CLASSIFICATION & CIRCUIT BREAKERS ---
     verdict = "HOLD (Mixed Signals)"
     color = "gray"
 
-    # Circuit Breakers (Overvaluation & Extreme Risk)
+    if pe_ratio <= 0.0:
+        neg_flags.append("🚨 Valuation / Earnings: Negative or unlisted P/E (Loss-making or nil EPS).")
+
+    # Circuit Breakers (Overvaluation & Capital Waste)
     if pe_ratio > 80 and roce < 15:
         verdict = "HIGH RISK (Overvalued Momentum)"
         color = "red"
     elif len(neg_flags) >= 4 or book_value <= 0:
         verdict = "AVOID / SELL"
         color = "red"
-    # Setup A: Breakout Inflection (Trading in high zone + Institutional backing + Operating Leverage)
-    elif breakout_proximity_pct >= 90.0 and inst_accumulating and (pat_yoy > 20.0 or sales_yoy > 15.0) and pe_ratio <= 65:
+    # Setup A: Breakout Inflection (Near 52W Highs + Smart Money + Earnings Velocity)
+    elif breakout_proximity_pct >= 90.0 and inst_accumulating and (q_pat_yoy > 25.0 or pat_yoy > 20.0) and (0 < pe_ratio <= 65):
         verdict = "BUY (Breakout Inflection / High Momentum)"
         color = "#00c853"
-    # Setup B: Contrarian Deep Value / Cyclical Turnaround (Downtrend + Strong Balance Sheet + Low D/E)
-    elif drawdown_pct >= 25.0 and debt_equity < 0.4 and cfo_pat_ratio >= 0.75 and (pe_ratio < 25.0 or cwip_ratio >= 15.0):
+    # Setup B: Contrarian Deep Value / Turnaround (Patched: Strictly requires positive P/E or Net Cash)
+    elif drawdown_pct >= 25.0 and debt_equity < 0.4 and cfo_pat_ratio >= 0.75 and ((0 < pe_ratio <= 25.0) or (cwip_ratio >= 15.0 and debt_equity < 0.2)):
         verdict = "CONTRARIAN BUY (Cyclical Turnaround / Deep Value)"
         color = "#00bcd4"
-    # Setup C: Classic Steady Compounder
-    elif roce >= 18.0 and sales_yoy >= 12.0 and pe_ratio <= 45 and debt_equity < 0.8:
+    # Setup C: Steady Compounder
+    elif roce >= 18.0 and sales_yoy >= 12.0 and (0 < pe_ratio <= 45) and debt_equity < 0.8:
         verdict = "BUY (Steady Compounder)"
         color = "blue"
     elif pe_ratio > 50:
@@ -239,7 +287,8 @@ def evaluate_fundamentals(data: dict) -> dict:
         "clean_metrics": {
             "Market Cap (Cr)": market_cap, "P/E": pe_ratio, "P/B": round(pb, 2),
             "ROCE %": roce, "ROE %": roe, "D/E": debt_equity, "Sales YoY %": round(sales_yoy, 2),
-            "PAT YoY %": round(pat_yoy, 2), "Drawdown from 52W High %": round(drawdown_pct, 1),
+            "PAT YoY %": round(pat_yoy, 2), "Quarterly PAT YoY %": round(q_pat_yoy, 1),
+            "Drawdown from 52W High %": round(drawdown_pct, 1),
             "CWIP to Fixed Assets %": round(cwip_ratio, 1)
         }
     }
@@ -289,7 +338,7 @@ Reconcile your thesis directly with the Quantitative Engine's verdict: **{quant_
 --- QUANTITATIVE METRICS & TECHNICAL POSITION ---
 - Valuation: P/E {metrics['P/E']}x | P/B {metrics['P/B']}x | Market Cap: ₹{metrics['Market Cap (Cr)']} Cr
 - Quality & Solvency: ROCE {metrics['ROCE %']}% | ROE {metrics['ROE %']}% | D/E {metrics['D/E']}x
-- Inflection Indicators: Sales YoY {metrics['Sales YoY %']}% | PAT YoY {metrics['PAT YoY %']}% | CWIP/Fixed Assets: {metrics['CWIP to Fixed Assets %']}%
+- Inflection Indicators: Annual PAT YoY {metrics['PAT YoY %']}% | Qtr PAT YoY {metrics['Quarterly PAT YoY %']}% | CWIP/Fixed Assets: {metrics['CWIP to Fixed Assets %']}%
 - Chart Position: Drawdown from 52-Week High: {metrics['Drawdown from 52W High %']}%
 - Strengths Detected: {observations}
 - Risks Detected: {flags}
@@ -299,7 +348,7 @@ Reconcile your thesis directly with the Quantitative Engine's verdict: **{quant_
 
 --- REQUIRED MULTIBAGGER THESIS STRUCTURE ---
 1. Structural Context & Valuation: Address whether this is a Steady Compounder, a Breakout Setup, or a Beaten-down Cyclical Turnaround. Reconcile current valuation multiples against earnings velocity.
-2. Inflection Catalysts (CWIP / Operating Leverage): Evaluate if upcoming capex commercialization or margin expansion justifies multi-year re-rating.
+2. Inflection Catalysts (CWIP / Quarterly Growth): Evaluate if recent quarterly acceleration or upcoming capex commercialization justifies a multi-year re-rating.
 3. Supply Overhang: If promoter holding ({promoter_holding}%) exceeds 75%, explicitly state the {overhang_pct:.2f}% excess stake (approx ₹{overhang_cr:.2f} Cr) creating a supply ceiling.
 4. Final Institutional Stance: Conclude with a definitive stance (BUY, CONTRARIAN BUY, WATCH, or AVOID) strictly reconciled with the quantitative verdict.
 
@@ -345,12 +394,11 @@ if 'eval_results' in st.session_state:
     
     st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
     
-    # Primary Metrics Bar
     cols = st.columns(6)
     cols[0].metric("Market Cap (Cr)", f"{metrics['Market Cap (Cr)']:,.0f}")
     cols[1].metric("P/E", metrics["P/E"])
     cols[2].metric("ROCE", f"{metrics['ROCE %']}%")
-    cols[3].metric("PAT YoY", f"{metrics['PAT YoY %']}%")
+    cols[3].metric("Qtr PAT YoY", f"{metrics['Quarterly PAT YoY %']}%")
     cols[4].metric("52W Drawdown", f"-{metrics['Drawdown from 52W High %']}%")
     cols[5].metric("CWIP / Fixed Assets", f"{metrics['CWIP to Fixed Assets %']}%")
     st.divider()
@@ -368,7 +416,7 @@ if 'eval_results' in st.session_state:
                 st.write(obs)
                 
         with ui_col2:
-            st.error("⚠️ Risk Factors, Friction & Valuation Overhang")
+            st.error("⚠️️ Risk Factors, Friction & Valuation Overhang")
             if not eval_results["flags"]: 
                 st.write("No major red flags detected.")
             for flag in eval_results["flags"]:
