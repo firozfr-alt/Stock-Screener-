@@ -33,16 +33,16 @@ def fetch_screener_data(ticker: str) -> dict:
     soup = BeautifulSoup(resp.content, "html.parser")
     data = {"ticker": clean_ticker, "tables": {}}
 
+    # Scrape top-ratios container, preserving multi-value tags like High / Low
     ratio_items = soup.select("#top-ratios li")
     for li in ratio_items:
         name_elem = li.select_one(".name")
-        val_elem = li.select_one(".nowrap .number")
+        val_elem = li.select_one(".value") or li.select_one(".nowrap")
         if name_elem and val_elem:
             name = name_elem.text.strip().lower()
-            val_clean = val_elem.text.strip().replace(",", "")
+            val_clean = val_elem.text.strip().replace(",", "").replace("₹", "").strip()
             data[name] = val_clean 
 
-    # Capturing financial statements and ratios (Debtor Days / Working Capital)
     table_ids = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "shareholding", "ratios"]
     for tid in table_ids:
         div = soup.find(id=tid)
@@ -74,7 +74,7 @@ def extract_trend(df, keyword: str):
         return []
 
 # ==========================================
-# 2. ADVANCED QUANTITATIVE SCORING ENGINE
+# 2. ADVANCED INFLECTION & BREAKOUT ENGINE
 # ==========================================
 def evaluate_fundamentals(data: dict) -> dict:
     if "error" in data:
@@ -91,6 +91,7 @@ def evaluate_fundamentals(data: dict) -> dict:
         except (ValueError, TypeError): 
             return default
 
+    # Core Ratios
     book_value = safe_float(data.get("book value"), 1.0)
     current_price = safe_float(data.get("current price"), 0.0)
     market_cap = safe_float(data.get("market cap"), 0.0)
@@ -101,107 +102,133 @@ def evaluate_fundamentals(data: dict) -> dict:
     pledge = safe_float(data.get("pledged percentage"), 0.0)
     pb = (current_price / book_value) if book_value > 0 else 999.0
 
-    # 1. Solvency & Balance Sheet Health
+    # 1. 52-Week High / Low & Breakout Proximity Analysis
+    high_52w, low_52w = 0.0, 0.0
+    drawdown_pct = 0.0
+    breakout_proximity_pct = 0.0
+    high_low_str = data.get("high / low", "")
+    if "/" in high_low_str:
+        parts = high_low_str.split("/")
+        high_52w = safe_float(parts[0].strip(), 0.0)
+        low_52w = safe_float(parts[1].strip(), 0.0)
+        if high_52w > 0 and current_price > 0:
+            drawdown_pct = ((high_52w - current_price) / high_52w) * 100.0
+            breakout_proximity_pct = (current_price / high_52w) * 100.0
+
+    # 2. Solvency & Balance Sheet Integrity
     if book_value <= 0: 
         neg_flags.append("🚨 Balance Sheet: Negative Net Worth / Book Value.")
     if pledge > 5.0: 
         neg_flags.append(f"🚨 Shareholding: High Promoter Pledge at {pledge}%.")
     if debt_equity > 1.5: 
-        neg_flags.append(f"🚨 Solvency: High Debt-to-Equity at {debt_equity}x.")
-    elif debt_equity < 0.5: 
-        pos_flags.append(f"✅ Balance Sheet: Conservative leverage with D/E of {debt_equity}x.")
-    
-    # 2. Capital Efficiency
+        neg_flags.append(f"🚨 Solvency: Elevated Debt-to-Equity at {debt_equity}x.")
+    elif debt_equity < 0.3: 
+        pos_flags.append(f"✅ Balance Sheet Fortress: Ultra-low D/E of {debt_equity}x provides strong downside protection.")
+
+    # 3. Capital Efficiency (Current & Multi-Year Resilience)
     if roce >= 15.0 and roe >= 15.0:
         pos_flags.append(f"✅ Capital Efficiency: High compounding returns — ROCE {roce}%, ROE {roe}%.")
-    else:
-        neg_flags.append(f"⚠️ Capital Efficiency: Sub-par Return Ratios — ROCE {roce}%, ROE {roe}%.")
+    elif roce < 10.0:
+        neg_flags.append(f"⚠️ Capital Efficiency: Trough or sub-par return ratios — ROCE {roce}%, ROE {roe}%.")
 
-    # 3. Growth & Operating Leverage
+    # 4. Operating Leverage & Growth Inflection (Sales vs PAT Acceleration)
     pnl_df = tables.get("profit-loss")
     sales = extract_trend(pnl_df, "Sales")
-    sales_yoy = 0.0
+    net_profit = extract_trend(pnl_df, "Net Profit")
+    sales_yoy, pat_yoy = 0.0, 0.0
+    
     if sales and len(sales) >= 2:
         sales_yoy = ((sales[-1] - sales[-2]) / abs(sales[-2])) * 100 if sales[-2] != 0 else 0.0
-        if sales_yoy > 15: 
-            pos_flags.append(f"✅ Topline: Solid YoY Sales Growth of {sales_yoy:.1f}%.")
-        elif sales_yoy < 0: 
-            neg_flags.append(f"🚨 Topline: Sales contracted YoY by {sales_yoy:.1f}%.")
+    if net_profit and len(net_profit) >= 2:
+        pat_yoy = ((net_profit[-1] - net_profit[-2]) / abs(net_profit[-2])) * 100 if net_profit[-2] != 0 else 0.0
 
-    q_df = tables.get("quarters")
-    opm_trend = extract_trend(q_df, "OPM")
-    if opm_trend and len(opm_trend) >= 4:
-        recent_opm = opm_trend[-4:]
-        if recent_opm[-1] > recent_opm[0]:
-            pos_flags.append(f"✅ Margin Expansion: OPM improved from {recent_opm[0]}% to {recent_opm[-1]}%.")
-        elif recent_opm[-1] < recent_opm[0] - 2:
-            neg_flags.append(f"⚠️ Margins: OPM contracting from {recent_opm[0]}% down to {recent_opm[-1]}%.")
+    # Operating Leverage Detection: Profits accelerating significantly faster than sales
+    if pat_yoy > 25.0 and pat_yoy > (sales_yoy * 1.5):
+        pos_flags.append(f"🚀 Operating Leverage Active: PAT grew {pat_yoy:.1f}% vs Sales growth of {sales_yoy:.1f}%.")
+    elif sales_yoy > 15.0:
+        pos_flags.append(f"✅ Topline Momentum: Solid YoY Sales Growth of {sales_yoy:.1f}%.")
+    elif sales_yoy < -5.0:
+        neg_flags.append(f"🚨 Topline Drag: Sales contracted YoY by {sales_yoy:.1f}%.")
 
-    # 4. Forensic Checks: Earnings Quality (CFO vs PAT) & Free Cash Flow (FCF)
+    # 5. J-Curve Catalyst: CWIP to Fixed Assets Shift (Upcoming Capex Monetization)
+    bs_df = tables.get("balance-sheet")
+    cwip_trend = extract_trend(bs_df, "CWIP") or extract_trend(bs_df, "Capital Work in Progress")
+    fixed_assets_trend = extract_trend(bs_df, "Fixed assets")
+
+    cwip_ratio = 0.0
+    if cwip_trend and fixed_assets_trend and fixed_assets_trend[-1] > 0:
+        cwip_ratio = (cwip_trend[-1] / fixed_assets_trend[-1]) * 100.0
+        if cwip_ratio >= 15.0:
+            pos_flags.append(f"🏭 Capex Inflection (J-Curve): CWIP stands at {cwip_ratio:.1f}% of Fixed Assets (Capacity expansion nearing completion).")
+
+    # 6. Forensic Checks: Earnings Quality & Free Cash Flow
     cf_df = tables.get("cash-flow")
-    net_profit_trend = extract_trend(pnl_df, "Net Profit")
     cfo_trend = extract_trend(cf_df, "Operating Activity")
     capex_trend = extract_trend(cf_df, "Fixed assets purchased")
 
-    if net_profit_trend and cfo_trend:
-        min_len = min(len(net_profit_trend), len(cfo_trend), 3)
+    cfo_pat_ratio = 1.0
+    if net_profit and cfo_trend:
+        min_len = min(len(net_profit), len(cfo_trend), 3)
         if min_len >= 3:
-            sum_pat = sum(net_profit_trend[-min_len:])
+            sum_pat = sum(net_profit[-min_len:])
             sum_cfo = sum(cfo_trend[-min_len:])
             if sum_pat > 0:
                 cfo_pat_ratio = sum_cfo / sum_pat
                 if cfo_pat_ratio < 0.5:
-                    neg_flags.append(f"🚨 Earnings Quality: Poor cash conversion. 3-Yr CFO is only {cfo_pat_ratio*100:.0f}% of Net Profit (Paper Profits).")
+                    neg_flags.append(f"🚨 Earnings Quality: 3-Yr cumulative CFO is only {cfo_pat_ratio*100:.0f}% of Net Profit (Paper profits).")
                 elif cfo_pat_ratio >= 0.8:
-                    pos_flags.append(f"✅ Earnings Quality: Reliable conversion (3-Yr CFO is {cfo_pat_ratio*100:.0f}% of Net Profit).")
+                    pos_flags.append(f"✅ Cash Conversion: Strong cash generation (3-Yr CFO is {cfo_pat_ratio*100:.0f}% of Net Profit).")
 
-        if capex_trend:
-            recent_cfo = cfo_trend[-1]
-            recent_capex = capex_trend[-1]
-            fcf = recent_cfo - abs(recent_capex)
-            if fcf < 0:
-                neg_flags.append(f"⚠️ Free Cash Flow: Negative FCF (₹{fcf:.0f} Cr). Capex exceeds operating cash flow.")
-            else:
-                pos_flags.append(f"✅ Free Cash Flow: Positive FCF generation (₹{fcf:.0f} Cr) after growth capex.")
-
-    # 5. Working Capital Integrity (Debtor Days)
-    ratios_df = tables.get("ratios")
-    debtor_days = extract_trend(ratios_df, "Debtor Days")
-    if debtor_days and len(debtor_days) >= 2:
-        if debtor_days[-2] > 0 and (debtor_days[-1] / debtor_days[-2]) > 1.3:
-            neg_flags.append(f"🚨 Working Capital: Debtor days spiked from {debtor_days[-2]} to {debtor_days[-1]} days (High collection risk).")
-        elif debtor_days[-1] < 45:
-            pos_flags.append(f"✅ Working Capital: Rapid cash conversion cycle ({debtor_days[-1]} Debtor Days).")
-
-    # 6. Shareholding & Regulatory Overhang
+    # 7. Institutional Stealth Accumulation vs Price Position
     sh_df = tables.get("shareholding")
+    fii = extract_trend(sh_df, "FIIs")
+    dii = extract_trend(sh_df, "DIIs")
+    inst_accumulating = False
+    if fii and dii and len(fii) >= 2 and len(dii) >= 2:
+        inst_latest = fii[-1] + dii[-1]
+        inst_prev = fii[-2] + dii[-2]
+        if inst_latest > inst_prev:
+            inst_accumulating = True
+            pos_flags.append(f"🐋 Institutional Accumulation: Smart money increased stake from {inst_prev:.2f}% to {inst_latest:.2f}%.")
+        elif (inst_prev - inst_latest) > 2.0:
+            neg_flags.append(f"⚠️️ Institutional Outflow: Smart money trimmed stake by {inst_prev - inst_latest:.2f}%.")
+
+    # 8. Shareholding & Regulatory Overhang
     promoter = extract_trend(sh_df, "Promoters")
     current_promoter_holding = 0.0
     if promoter and len(promoter) >= 1:
         current_promoter_holding = promoter[-1]
         if current_promoter_holding > 75.0:
-            neg_flags.append(f"🚨 Regulatory Overhang: Promoter stake at {current_promoter_holding}% breaches SEBI 75% limit.")
+            neg_flags.append(f"🚨 Regulatory Overhang: Promoter stake ({current_promoter_holding}%) breaches SEBI 75% limit.")
         else:
             pos_flags.append(f"✅ Stable promoter holding at {current_promoter_holding}%.")
 
-    # --- VALUATION CIRCUIT BREAKERS ---
+    # --- ADVANCED DUAL-ENGINE VERDICT CLASSIFICATION ---
+    verdict = "HOLD (Mixed Signals)"
+    color = "gray"
+
+    # Circuit Breakers (Overvaluation & Extreme Risk)
     if pe_ratio > 80 and roce < 15:
         verdict = "HIGH RISK (Overvalued Momentum)"
         color = "red"
+    elif len(neg_flags) >= 4 or book_value <= 0:
+        verdict = "AVOID / SELL"
+        color = "red"
+    # Setup A: Breakout Inflection (Trading in high zone + Institutional backing + Operating Leverage)
+    elif breakout_proximity_pct >= 90.0 and inst_accumulating and (pat_yoy > 20.0 or sales_yoy > 15.0) and pe_ratio <= 65:
+        verdict = "BUY (Breakout Inflection / High Momentum)"
+        color = "#00c853"
+    # Setup B: Contrarian Deep Value / Cyclical Turnaround (Downtrend + Strong Balance Sheet + Low D/E)
+    elif drawdown_pct >= 25.0 and debt_equity < 0.4 and cfo_pat_ratio >= 0.75 and (pe_ratio < 25.0 or cwip_ratio >= 15.0):
+        verdict = "CONTRARIAN BUY (Cyclical Turnaround / Deep Value)"
+        color = "#00bcd4"
+    # Setup C: Classic Steady Compounder
+    elif roce >= 18.0 and sales_yoy >= 12.0 and pe_ratio <= 45 and debt_equity < 0.8:
+        verdict = "BUY (Steady Compounder)"
+        color = "blue"
     elif pe_ratio > 50:
         verdict = "WATCH (Valuation Stretch)"
         color = "orange"
-    elif roce >= 18 and sales_yoy >= 12 and pe_ratio <= 50 and debt_equity < 1.0:
-        verdict = "BUY (Steady Compounder)"
-        color = "blue"
-    else:
-        verdict = "HOLD (Mixed Signals)"
-        color = "gray"
-
-    # Emergency Override for Accumulated Red Flags
-    if len(neg_flags) >= 4:
-        verdict = "AVOID / SELL"
-        color = "red"
 
     return {
         "verdict": verdict,
@@ -211,23 +238,25 @@ def evaluate_fundamentals(data: dict) -> dict:
         "promoter_holding": current_promoter_holding,
         "clean_metrics": {
             "Market Cap (Cr)": market_cap, "P/E": pe_ratio, "P/B": round(pb, 2),
-            "ROCE %": roce, "ROE %": roe, "D/E": debt_equity, "Sales YoY %": round(sales_yoy, 2)
+            "ROCE %": roce, "ROE %": roe, "D/E": debt_equity, "Sales YoY %": round(sales_yoy, 2),
+            "PAT YoY %": round(pat_yoy, 2), "Drawdown from 52W High %": round(drawdown_pct, 1),
+            "CWIP to Fixed Assets %": round(cwip_ratio, 1)
         }
     }
 
 # ==========================================
-# 3. WEB SEARCH & MULTIBAGGER CATALYST LAYER
+# 3. WEB SEARCH & MULTIBAGGER CONTEXT LAYER
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_market_context(ticker: str) -> str:
     try:
-        news = DDGS().text(f"{ticker} stock news India latest", max_results=2)
+        news = DDGS().text(f"{ticker} stock news India latest business", max_results=2)
         deals = DDGS().text(f"{ticker} bulk deal block deal NSE BSE", max_results=1)
-        concall = DDGS().text(f"{ticker} earnings call transcript summary management guidance capex order book", max_results=3)
+        concall = DDGS().text(f"{ticker} earnings call transcript management guidance capex order book expansion", max_results=3)
         
         context = "Live Market News:\n" + "\n".join([r['body'] for r in news]) if news else ""
         context += "\n\nBlock/Bulk Deals:\n" + "\n".join([r['body'] for r in deals]) if deals else ""
-        context += "\n\nManagement Guidance & Concall Transcripts:\n" + "\n".join([r['body'] for r in concall]) if concall else ""
+        context += "\n\nConcall & Guidance Insights:\n" + "\n".join([r['body'] for r in concall]) if concall else ""
         return context
     except Exception as e:
         return f"Market context search bypassed: {str(e)}"
@@ -250,33 +279,31 @@ def get_ai_verdict(ticker: str, metrics: dict, flags: list, observations: list, 
         market_context = fetch_market_context(ticker)
         client = genai.Client(api_key=api_key)
         
-        # Calculate exact SEBI Minimum Public Shareholding (MPS) overhang
         overhang_pct = max(0.0, promoter_holding - 75.0)
         overhang_cr = (overhang_pct / 100) * metrics.get("Market Cap (Cr)", 0)
         
         prompt = f"""
-You are a senior institutional equity research analyst evaluating the Indian listed stock: {ticker}.
-You MUST reconcile your investment thesis directly with the Quantitative Screener's findings below:
+You are a senior institutional equity portfolio manager evaluating {ticker}.
+Reconcile your thesis directly with the Quantitative Engine's verdict: **{quant_verdict}**.
 
---- QUANTITATIVE SCREENER FINDINGS ---
-Quantitative Verdict: {quant_verdict}
-Financial Ratios: P/E {metrics['P/E']}x | P/B {metrics['P/B']}x | ROCE {metrics['ROCE %']}% | ROE {metrics['ROE %']}% | D/E {metrics['D/E']}x | Sales YoY {metrics['Sales YoY %']}%
-Strengths Identified:
-{chr(10).join(['- ' + str(item) for item in observations])}
-Risks Identified:
-{chr(10).join(['- ' + str(item) for item in flags])}
+--- QUANTITATIVE METRICS & TECHNICAL POSITION ---
+- Valuation: P/E {metrics['P/E']}x | P/B {metrics['P/B']}x | Market Cap: ₹{metrics['Market Cap (Cr)']} Cr
+- Quality & Solvency: ROCE {metrics['ROCE %']}% | ROE {metrics['ROE %']}% | D/E {metrics['D/E']}x
+- Inflection Indicators: Sales YoY {metrics['Sales YoY %']}% | PAT YoY {metrics['PAT YoY %']}% | CWIP/Fixed Assets: {metrics['CWIP to Fixed Assets %']}%
+- Chart Position: Drawdown from 52-Week High: {metrics['Drawdown from 52W High %']}%
+- Strengths Detected: {observations}
+- Risks Detected: {flags}
 
---- LIVE MARKET CONTEXT & CONCALL TRANSCRIPT NOTES ---
+--- MANAGEMENT GUIDANCE & CONCALL TRANSCRIPT CONTEXT ---
 {market_context}
 
---- TASKS FOR YOUR THESIS ---
-1. Implied Growth Reality Check: At {metrics['P/E']}x P/E, what level of multi-year EPS growth is the market discounting? Reconcile this against historical sales growth ({metrics['Sales YoY %']}%) and capital efficiency ({metrics['ROCE %']}% ROCE).
-2. Regulatory Supply Barrier: The promoters hold {promoter_holding}%. If this exceeds 75%, explicitly calculate the supply overhang of {overhang_pct:.2f}% (approx ₹{overhang_cr:.2f} Cr) that must be liquidated to meet SEBI compliance.
-3. Multibagger Inflection & Management Guidance: Review the concall and management commentary above. Is there an active catalyst (capacity expansion, major order book, operating leverage) that justifies a multibagger re-rating, or is growth already priced in?
-4. Final Institutional Stance: Conclude with a clear recommendation (BUY, HOLD, WATCH, or AVOID) that directly aligns with the quantitative screening verdict or provides institutional justification for an override.
+--- REQUIRED MULTIBAGGER THESIS STRUCTURE ---
+1. Structural Context & Valuation: Address whether this is a Steady Compounder, a Breakout Setup, or a Beaten-down Cyclical Turnaround. Reconcile current valuation multiples against earnings velocity.
+2. Inflection Catalysts (CWIP / Operating Leverage): Evaluate if upcoming capex commercialization or margin expansion justifies multi-year re-rating.
+3. Supply Overhang: If promoter holding ({promoter_holding}%) exceeds 75%, explicitly state the {overhang_pct:.2f}% excess stake (approx ₹{overhang_cr:.2f} Cr) creating a supply ceiling.
+4. Final Institutional Stance: Conclude with a definitive stance (BUY, CONTRARIAN BUY, WATCH, or AVOID) strictly reconciled with the quantitative verdict.
 
-CRITICAL FORMATTING INSTRUCTION:
-Throughout your output, you MUST wrap positive drivers and tailwinds in :green[text] and risk factors or valuation concerns in :red[text].
+FORMATTING RULE: Wrap all strengths and catalysts in :green[text] and all risks, valuation flags, or dilution hurdles in :red[text].
 """
         config = types.GenerateContentConfig(temperature=0.2)
         
@@ -287,7 +314,7 @@ Throughout your output, you MUST wrap positive drivers and tailwinds in :green[t
                 return generate_content_with_backoff(client, prompt, config, 'gemini-3.1-flash-lite').text
             raise primary_error
     except Exception as e:
-        return f"⚠️ AI analysis failed: {str(e)}"
+        return f"⚠️ AI thesis generation failed: {str(e)}"
 
 # ==========================================
 # 4. STREAMLIT UI DASHBOARD
@@ -297,10 +324,10 @@ st.title("Fundamental Screener")
 
 col_search, _ = st.columns([1, 2])
 with col_search:
-    ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC):", "")
+    ticker_input = st.text_input("🔍 Enter NSE/BSE Symbol (e.g., TATASTEEL, ITC, UNIMECH):", "")
 
 if st.button("Run Quantitative Analysis") and ticker_input:
-    with st.spinner(f"Fetching math and fundamentals for {ticker_input.upper()}..."):
+    with st.spinner(f"Auditing fundamentals, capex cycle, and price position for {ticker_input.upper()}..."):
         raw_data = fetch_screener_data(ticker_input)
         if "error" in raw_data:
             st.error(raw_data["error"])
@@ -318,41 +345,42 @@ if 'eval_results' in st.session_state:
     
     st.markdown(f"<h3 style='color: {eval_results['color']};'>Verdict: {eval_results['verdict']}</h3>", unsafe_allow_html=True)
     
+    # Primary Metrics Bar
     cols = st.columns(6)
     cols[0].metric("Market Cap (Cr)", f"{metrics['Market Cap (Cr)']:,.0f}")
     cols[1].metric("P/E", metrics["P/E"])
-    cols[2].metric("P/B", metrics["P/B"])
-    cols[3].metric("ROCE", f"{metrics['ROCE %']}%")
-    cols[4].metric("ROE", f"{metrics['ROE %']}%")
-    cols[5].metric("Debt/Equity", f"{metrics['D/E']}x")
+    cols[2].metric("ROCE", f"{metrics['ROCE %']}%")
+    cols[3].metric("PAT YoY", f"{metrics['PAT YoY %']}%")
+    cols[4].metric("52W Drawdown", f"-{metrics['Drawdown from 52W High %']}%")
+    cols[5].metric("CWIP / Fixed Assets", f"{metrics['CWIP to Fixed Assets %']}%")
     st.divider()
 
-    tab1, tab2 = st.tabs(["📊 Trend Audit", "🧠 AI Analyst Thesis (On-Demand)"])
+    tab1, tab2 = st.tabs(["📊 Trend & Inflection Audit", "🧠 Multibagger AI Thesis"])
     
     with tab1:
         ui_col1, ui_col2 = st.columns(2)
         
         with ui_col1:
-            st.success("✅ Positive Observations (Tailwinds & Strengths)")
+            st.success("✅ Positive Observations & Growth Catalysts")
             if not eval_results["observations"]: 
-                st.write("None found.")
+                st.write("No major catalysts detected.")
             for obs in eval_results["observations"]:
                 st.write(obs)
                 
         with ui_col2:
-            st.error("⚠️ Risk Factors (Friction & Valuation)")
+            st.error("⚠️ Risk Factors, Friction & Valuation Overhang")
             if not eval_results["flags"]: 
-                st.write("None found.")
+                st.write("No major red flags detected.")
             for flag in eval_results["flags"]:
                 st.write(flag)
             
     with tab2:
-        st.write("Generating an AI thesis consumes API quota. Review the quantitative metrics before proceeding.")
+        st.write("The AI thesis reconciles the quantitative audit with concall transcripts, operating leverage, and capex cycles.")
         if "AVOID" in eval_results["verdict"] or "HIGH RISK" in eval_results["verdict"]:
-            st.warning("⚠️ This stock tripped quantitative risk breakers. Review the flagged risks before generating a thesis.")
+            st.warning("⚠️ This stock tripped quantitative risk breakers. Review the risks above before requesting an AI thesis.")
             
-        if st.button("Generate Deep AI Thesis 🧠"):
-            with st.spinner("Extracting concall guidance, live news, and synthesizing multibagger thesis..."):
+        if st.button("Generate Deep Multibagger Thesis 🧠"):
+            with st.spinner("Extracting concall commentary, verifying capex milestones, and synthesizing institutional stance..."):
                 ai_insight = get_ai_verdict(
                     ticker=ticker,
                     metrics=metrics,
